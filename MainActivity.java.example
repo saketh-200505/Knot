@@ -1,0 +1,48 @@
+// android/app/src/main/java/com/arcadevault/app/MainActivity.java
+//
+// This file is for a BARE workflow build only.
+// For Expo MANAGED workflow, use a config plugin or expo-build-properties.
+//
+// For managed workflow, add this plugin to app.json instead:
+//   "plugins": [["./plugins/withFlagSecure"]]
+// And create plugins/withFlagSecure.js (see README)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// BARE WORKFLOW VERSION:
+// Replace your existing MainActivity.java with this content.
+
+package com.arcadevault.app;
+
+import android.os.Bundle;
+import android.view.WindowManager;
+import com.facebook.react.ReactActivity;
+import com.facebook.react.ReactActivityDelegate;
+import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint;
+import com.facebook.react.defaults.DefaultReactActivityDelegate;
+
+public class MainActivity extends ReactActivity {
+
+  @Override
+  protected void onCreate(Bundle savedInstanceState) {
+    super.onCreate(null);
+    // Block screenshots and screen recording in recents/ADB
+    getWindow().setFlags(
+      WindowManager.LayoutParams.FLAG_SECURE,
+      WindowManager.LayoutParams.FLAG_SECURE
+    );
+  }
+
+  @Override
+  protected String getMainComponentName() {
+    return "main";
+  }
+
+  @Override
+  protected ReactActivityDelegate createReactActivityDelegate() {
+    return new DefaultReactActivityDelegate(
+      this,
+      getMainComponentName(),
+      DefaultNewArchitectureEntryPoint.getFabricEnabled()
+    );
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "name": "knot",
+  "version": "1.0.0",
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "build:android": "eas build --platform android",
+    "build:ios": "eas build --platform ios"
+  },
+  "dependencies": {
+    "expo": "~52.0.0",
+    "expo-asset": "~11.0.3",
+    "expo-constants": "~17.0.3",
+    "expo-status-bar": "~2.0.0",
+    "expo-crypto": "~14.0.1",
+    "expo-file-system": "~18.0.6",
+    "expo-media-library": "~16.0.5",
+    "expo-image-picker": "~16.0.6",
+    "expo-font": "~13.0.2",
+    "expo-modules-core": "~2.1.0",
+    "@react-native-async-storage/async-storage": "1.23.1",
+    "@expo-google-fonts/syne": "^0.2.3",
+    "@expo-google-fonts/dm-sans": "^0.2.3",
+    "@expo-google-fonts/space-mono": "^0.2.3",
+    "react": "18.3.1",
+    "react-native": "0.76.5"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.20.0"
+  },
+  "private": true
+}

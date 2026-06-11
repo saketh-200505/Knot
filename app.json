@@ -1,0 +1,63 @@
+{
+  "expo": {
+    "name": "Knot",
+    "slug": "knot",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash.png",
+      "backgroundColor": "#080a0f"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.knot.app",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "Knot needs photo access to import images.",
+        "NSPhotoLibraryAddUsageDescription": "Knot needs this to save exported photos.",
+        "NSCameraUsageDescription": "Knot can optionally use your camera."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#080a0f"
+      },
+      "package": "com.knot.app",
+      "permissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_IMAGES"
+      ],
+      "windowSoftInputMode": "adjustResize"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Knot needs access to select photos for your vault."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Knot to save exported photos.",
+          "savePhotosPermission": "Allow Knot to save exported photos.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "YOUR_EAS_PROJECT_ID"
+      }
+    }
+  }
+}

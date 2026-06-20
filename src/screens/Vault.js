@@ -34,10 +34,18 @@ import { Toast }       from '../components/Toast';
 import { GroupPicker } from '../components/GroupPicker';
 import { SharedTab }   from '../components/SharedTab';
 import { COLORS, FONTS, RADIUS, SPACING, GROUP_PALETTES } from '../utils/theme';
+import { getExternalVaultDir } from '../../modules/knot-vault-dir';
 
 const { width: SW, height: SH } = Dimensions.get('window');
 const THUMB = Math.floor((SW - 48) / 3);
-const VAULT_DIR = FileSystem.documentDirectory + 'vault/';
+// Prefer Android/data/<package>/files/vault/ — visible to file managers and
+// other apps (e.g. for sharing the still-encrypted .dat files directly)
+// without root, unlike the app's private internal sandbox. Requires the
+// local KnotVaultDir native module, which only exists in a custom dev
+// client / EAS build — NOT in Expo Go. Falls back to the internal sandbox
+// (documentDirectory) when that module isn't linked, or on iOS, so the app
+// still works everywhere; it just won't be externally browsable there.
+const VAULT_DIR = getExternalVaultDir() || (FileSystem.documentDirectory + 'vault/');
 const DEFAULT_GESTURE = ['up','up','down','down'];
 const ARROWS = { up:'↑', down:'↓', left:'←', right:'→' };
 
@@ -116,6 +124,8 @@ export function Vault({ onLogout }) {
   const [showExtend,        setShowExtend]        = useState(false);
   const [showExport,        setShowExport]        = useState(false);
   const [exportTarget,      setExportTarget]      = useState(null);
+  const [showShareDecrypt,  setShowShareDecrypt]  = useState(false);
+  const [shareDecryptIds,   setShareDecryptIds]   = useState(null);
 
   const [pending,           setPending]           = useState([]);
   const pendingRef = useRef([]);  // always current, no stale closure
@@ -407,6 +417,85 @@ export function Vault({ onLogout }) {
     setSelectMode(false); setSelected(new Set());
   };
 
+  // Shares the actual (decrypted) photo content — already-unlocked items are
+  // shared straight from session.decryptedMap; anything still locked prompts
+  // for its passphrase first. Each item's plaintext only ever touches disk
+  // as a temp file for the duration of the OS share sheet, then is deleted.
+  const shareDecryptedNow = async (targets) => {
+    if (!(await Sharing.isAvailableAsync())) { toast_('Sharing not available','error'); return; }
+    for (const p of targets) {
+      const uri = session.decryptedMap[p.id];
+      if (!uri || p.mediaType==='video') continue; // videos share from their own cache file, see VideoViewer
+      const ext = (p.mimeType||'image/jpeg').split('/')[1]||'jpg';
+      const tmp = `${FileSystem.cacheDirectory}sh_${p.id}.${ext}`;
+      try {
+        await FileSystem.writeAsStringAsync(tmp, uri.split(',')[1], {encoding:FileSystem.EncodingType.Base64});
+        await Sharing.shareAsync(tmp,{mimeType:p.mimeType||'image/jpeg'});
+      } finally {
+        await FileSystem.deleteAsync(tmp,{idempotent:true}).catch(()=>{});
+      }
+    }
+    logEvent('share_decrypted',`${targets.length}`).catch(()=>{});
+  };
+
+  const shareDecrypted = async (id) => {
+    const targets = id ? [photos.find(p=>p.id===id)].filter(Boolean) : photos.filter(p=>selected.has(p.id));
+    if (!targets.length) return;
+    const locked = targets.filter(p=>!session.decryptedMap[p.id]);
+    if (locked.length===0) {
+      await shareDecryptedNow(targets);
+      setSelectMode(false); setSelected(new Set());
+      return;
+    }
+    setShareDecryptIds(targets.map(p=>p.id));
+    setShowShareDecrypt(true);
+  };
+
+  const handleShareDecryptConfirm = async (pw) => {
+    setShowShareDecrypt(false);
+    const ids = shareDecryptIds || [];
+    const targets = photos.filter(p=>ids.includes(p.id));
+    if (!targets.length) return;
+    if (!(await Sharing.isAvailableAsync())) { toast_('Sharing not available','error'); return; }
+    setProc(`Decrypting 0 of ${targets.length}`);
+    let count=0;
+    for (let i=0;i<targets.length;i++) {
+      const p = targets[i];
+      setProc(`Decrypting ${i+1} of ${targets.length}`);
+      await new Promise(r=>InteractionManager.runAfterInteractions(r));
+      const uri = session.decryptedMap[p.id];
+      try {
+        if (uri) {
+          if (p.mediaType!=='video') { await shareDecryptedNow([p]); count++; }
+        } else {
+          const b64   = await FileSystem.readAsStringAsync(p.filePath,{encoding:FileSystem.EncodingType.Base64});
+          const plain = await unseal(base64ToUint8(b64), pw, {iterations:p.kdfIterations||LEGACY_KDF_ITERATIONS});
+          const ext   = (p.mimeType||'image/jpeg').split('/')[1]||'jpg';
+          const tmp   = `${FileSystem.cacheDirectory}sh_${p.id}.${ext}`;
+          try {
+            await FileSystem.writeAsStringAsync(tmp, uint8ToBase64(plain), {encoding:FileSystem.EncodingType.Base64});
+            await Sharing.shareAsync(tmp,{mimeType:p.mimeType||'image/jpeg'});
+            count++;
+          } finally {
+            await FileSystem.deleteAsync(tmp,{idempotent:true}).catch(()=>{});
+          }
+        }
+      } catch { /* wrong passphrase / corrupt — skip this one */ }
+    }
+    setProc('');
+    setSelectMode(false); setSelected(new Set()); setShareDecryptIds(null);
+    count>0 ? logEvent('share_decrypted',`${count}`).catch(()=>{})
+            : toast_('Share failed — check passphrase','error');
+  };
+
+  const promptShare = (id) => {
+    Alert.alert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual photo?', [
+      {text:'Cancel', style:'cancel'},
+      {text:'Encrypted file', onPress:()=>shareEnc(id)},
+      {text:'Actual photo', onPress:()=>shareDecrypted(id)},
+    ]);
+  };
+
   // ── SAVE SHARED TO VAULT ──────────────────────────────────────────────────
   const saveToVault = async (sp, pw, g) => {
     if (!sp) return;
@@ -625,7 +714,7 @@ export function Vault({ onLogout }) {
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{gap:8}}>
               {[
                 {label:'Export', color:COLORS.sky,    fn:()=>{setExportTarget(null);setShowExport(true);}},
-                {label:'Share',  color:COLORS.purple,  fn:()=>shareEnc(null)},
+                {label:'Share',  color:COLORS.purple,  fn:()=>promptShare(null)},
                 {label:'Delete', color:COLORS.rose,    fn:()=>deleteSelected()},
                 {label:'Cancel', color:COLORS.textMuted,fn:()=>{setSelectMode(false);setSelected(new Set());}},
               ].map(({label,color,fn})=>(
@@ -778,14 +867,32 @@ export function Vault({ onLogout }) {
     const uri=session.decryptedMap[viewPhoto.id];
     if (!uri) return null;
 
-    const doShare=()=>{
+    const doShare=async()=>{
       const ext=(viewPhoto.mimeType||'image/jpeg').split('/')[1]||'jpg';
       const tmp=`${FileSystem.cacheDirectory}sh_${viewPhoto.id}.${ext}`;
-      FileSystem.writeAsStringAsync(tmp,uri.split(',')[1],{encoding:FileSystem.EncodingType.Base64})
-        .then(()=>Sharing.isAvailableAsync())
-        .then(ok=>ok&&Sharing.shareAsync(tmp,{mimeType:viewPhoto.mimeType||'image/jpeg'}))
-        .then(()=>logEvent('share_decrypted',viewPhoto.name).catch(()=>{}))
-        .catch(e=>toast_('Share failed: '+e.message,'error'));
+      try {
+        await FileSystem.writeAsStringAsync(tmp,uri.split(',')[1],{encoding:FileSystem.EncodingType.Base64});
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(tmp,{mimeType:viewPhoto.mimeType||'image/jpeg'});
+          logEvent('share_decrypted',viewPhoto.name).catch(()=>{});
+        }
+      } catch(e) { toast_('Share failed: '+e.message,'error'); }
+      finally { await FileSystem.deleteAsync(tmp,{idempotent:true}).catch(()=>{}); }
+    };
+    const doShareEnc=async()=>{
+      try {
+        if (await Sharing.isAvailableAsync()) {
+          await Sharing.shareAsync(viewPhoto.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'});
+          logEvent('share_encrypted',viewPhoto.name).catch(()=>{});
+        }
+      } catch(e) { toast_('Share failed: '+e.message,'error'); }
+    };
+    const choosShare=()=>{
+      Alert.alert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual photo?', [
+        {text:'Cancel', style:'cancel'},
+        {text:'Encrypted file', onPress:doShareEnc},
+        {text:'Actual photo', onPress:doShare},
+      ]);
     };
 
     return (
@@ -801,7 +908,7 @@ export function Vault({ onLogout }) {
           <TouchableOpacity style={vw.barBtn} onPress={()=>{setExportTarget(viewPhoto.id);setViewPhoto(null);setShowExport(true);}} activeOpacity={0.7}>
             <Text style={vw.barTxt}>⬇  Export</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[vw.barBtn,vw.barBtnBlue]} onPress={doShare} activeOpacity={0.7}>
+          <TouchableOpacity style={[vw.barBtn,vw.barBtnBlue]} onPress={choosShare} activeOpacity={0.7}>
             <Text style={vw.barTxt}>↗  Share</Text>
           </TouchableOpacity>
         </View>
@@ -812,6 +919,23 @@ export function Vault({ onLogout }) {
   // ── VIDEO VIEWER ──────────────────────────────────────────────────────────
   const VideoViewer = () => {
     if (!viewVideo) return null;
+    const choosShareVid=()=>{
+      Alert.alert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual video?', [
+        {text:'Cancel', style:'cancel'},
+        {text:'Encrypted file', onPress:()=>{
+          Sharing.isAvailableAsync()
+            .then(ok=>ok&&Sharing.shareAsync(viewVideo.photo.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'}))
+            .then(()=>logEvent('share_encrypted',viewVideo.photo.name).catch(()=>{}))
+            .catch(e=>toast_('Share failed: '+e.message,'error'));
+        }},
+        {text:'Actual video', onPress:()=>{
+          Sharing.isAvailableAsync()
+            .then(ok=>ok&&Sharing.shareAsync(viewVideo.uri,{mimeType:viewVideo.photo.mimeType||'video/mp4'}))
+            .then(()=>logEvent('share_decrypted',viewVideo.photo.name).catch(()=>{}))
+            .catch(e=>toast_('Share failed: '+e.message,'error'));
+        }},
+      ]);
+    };
     return (
       <View style={vw.root}>
         <TouchableOpacity style={vw.closeBtn} onPress={()=>setViewVideo(null)} hitSlop={{top:16,bottom:16,left:16,right:16}} activeOpacity={0.7}>
@@ -823,12 +947,7 @@ export function Vault({ onLogout }) {
           <TouchableOpacity style={vw.barBtn} onPress={()=>{setExportTarget(viewVideo.photo.id);setViewVideo(null);setShowExport(true);}} activeOpacity={0.7}>
             <Text style={vw.barTxt}>⬇  Export</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={[vw.barBtn,vw.barBtnBlue]} onPress={()=>{
-            Sharing.isAvailableAsync()
-              .then(ok=>ok&&Sharing.shareAsync(viewVideo.uri,{mimeType:viewVideo.photo.mimeType||'video/mp4'}))
-              .then(()=>logEvent('share_decrypted',viewVideo.photo.name).catch(()=>{}))
-              .catch(e=>toast_('Share failed: '+e.message,'error'));
-          }} activeOpacity={0.7}>
+          <TouchableOpacity style={[vw.barBtn,vw.barBtnBlue]} onPress={choosShareVid} activeOpacity={0.7}>
             <Text style={vw.barTxt}>↗  Share</Text>
           </TouchableOpacity>
         </View>
@@ -869,6 +988,8 @@ export function Vault({ onLogout }) {
         title="Session Expired" subtitle="Re-enter passphrase to continue" confirmLabel="Extend" loading={!!proc}/>
       <PassSheet visible={showExport} onClose={()=>setShowExport(false)} onConfirm={handleExport}
         title="Export" subtitle="Enter passphrase to decrypt and save" confirmLabel="Export" loading={!!proc}/>
+      <PassSheet visible={showShareDecrypt} onClose={()=>{setShowShareDecrypt(false);setShareDecryptIds(null);}} onConfirm={handleShareDecryptConfirm}
+        title="Share Photo" subtitle="Enter passphrase to decrypt and share" confirmLabel="Share" loading={!!proc}/>
 
       <GroupPicker visible={showGroupPick} onClose={()=>{setShowGroupPick(false);setPending([]);}} groups={groups} count={pending.length} onPick={onPickGroup} onCreateNew={onCreateNew}/>
 

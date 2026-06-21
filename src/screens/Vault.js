@@ -605,7 +605,8 @@ export function Vault({ onLogout }) {
       const salt=base64ToUint8(g.salt), key=deriveKey(pw,salt,DEFAULT_KDF_ITERATIONS);
       const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt);
       const id=genId(), path=await writeVaultFile(g, id, sealed);
-      await addPhotoToIndex({id,filePath:path,mimeType:sp.mime||'image/jpeg',mediaType:'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:3,kdfIterations:DEFAULT_KDF_ITERATIONS,groupId:g.id,groupLabel:g.label});
+      const mime = sp.mime||'image/jpeg';
+      await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:3,kdfIterations:DEFAULT_KDF_ITERATIONS,groupId:g.id,groupLabel:g.label});
       await loadPhotos(); logEvent('shared_saved_to_vault',g.label).catch(()=>{});
       sp.onDone?.();
     } catch(e){ toast_('Save failed: '+e.message,'error'); }

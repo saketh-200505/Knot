@@ -6,6 +6,7 @@ import {
 import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
+import { Video, ResizeMode } from 'expo-av';
 import {
   unseal, base64ToUint8, uint8ToBase64, LEGACY_KDF_ITERATIONS,
 } from '../utils/crypto';
@@ -29,6 +30,23 @@ function guessMime(name = '') {
   if (ext === 'gif') return 'image/gif';
   if (ext === 'webp') return 'image/webp';
   return 'image/jpeg';
+}
+
+// The filename alone is useless for this — every imported file is just
+// "<id>.dat" or "<groupId>_<id>.dat", with no real extension at all, so
+// guessMime() above always fell through to image/jpeg, even for videos.
+// Sniffing the actual decrypted bytes' magic numbers is the only reliable
+// way to know what we're looking at.
+function sniffMime(bytes, fallbackName) {
+  if (bytes && bytes.length >= 12) {
+    if (bytes[0]===0xFF && bytes[1]===0xD8 && bytes[2]===0xFF) return 'image/jpeg';
+    if (bytes[0]===0x89 && bytes[1]===0x50 && bytes[2]===0x4E && bytes[3]===0x47) return 'image/png';
+    if (bytes[0]===0x47 && bytes[1]===0x49 && bytes[2]===0x46 && bytes[3]===0x38) return 'image/gif';
+    if (bytes[0]===0x52 && bytes[1]===0x49 && bytes[2]===0x46 && bytes[3]===0x46 &&
+        bytes[8]===0x57 && bytes[9]===0x45 && bytes[10]===0x42 && bytes[11]===0x50) return 'image/webp';
+    if (bytes[4]===0x66 && bytes[5]===0x74 && bytes[6]===0x79 && bytes[7]===0x70) return 'video/mp4'; // ISO base media (mp4/mov/m4v)
+  }
+  return guessMime(fallbackName); // last resort
 }
 
 export function SharedTab({ onSaveToVault, showToast }) {
@@ -79,8 +97,17 @@ export function SharedTab({ onSaveToVault, showToast }) {
         }
       }
       const plainB64 = uint8ToBase64(plain);
-      const mime = guessMime(item.name);
-      setDecrypted(prev => ({ ...prev, [item.id]: { uri: `data:${mime};base64,${plainB64}`, plainB64, mime } }));
+      const mime = sniffMime(plain, item.name);
+      let uri;
+      if (mime.startsWith('video/')) {
+        // expo-av's Video component needs a real file path, not a data: URI
+        const ext = mime.split('/')[1] || 'mp4';
+        uri = `${FileSystem.cacheDirectory}shvid_${item.id}.${ext}`;
+        await FileSystem.writeAsStringAsync(uri, plainB64, { encoding: FileSystem.EncodingType.Base64 });
+      } else {
+        uri = `data:${mime};base64,${plainB64}`;
+      }
+      setDecrypted(prev => ({ ...prev, [item.id]: { uri, plainB64, mime } }));
       await logEvent('shared_unlock', item.name);
       showToast?.('Unlocked', 'success');
     } catch {
@@ -103,6 +130,7 @@ export function SharedTab({ onSaveToVault, showToast }) {
     if (!dec) return;
     onSaveToVault?.(dec.plainB64, dec.mime, item.name, async () => {
       await FileSystem.deleteAsync(item.filePath, { idempotent: true });
+      if (dec.mime?.startsWith('video/')) await FileSystem.deleteAsync(dec.uri, { idempotent: true }).catch(() => {});
       await removeImportedFromIndex(item.id);
       setDecrypted(prev => { const n = { ...prev }; delete n[item.id]; return n; });
       await load();
@@ -114,7 +142,9 @@ export function SharedTab({ onSaveToVault, showToast }) {
     Alert.alert('Remove file', `Remove "${item.name}"? This only deletes the encrypted file on this device.`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Remove', style: 'destructive', onPress: async () => {
+        const dec = decrypted[item.id];
         await FileSystem.deleteAsync(item.filePath, { idempotent: true });
+        if (dec?.mime?.startsWith('video/')) await FileSystem.deleteAsync(dec.uri, { idempotent: true }).catch(() => {});
         await removeImportedFromIndex(item.id);
         setDecrypted(prev => { const n = { ...prev }; delete n[item.id]; return n; });
         await load();
@@ -129,7 +159,9 @@ export function SharedTab({ onSaveToVault, showToast }) {
       <View style={s.card}>
         {dec ? (
           <TouchableOpacity onPress={() => setViewItem(item)}>
-            <Image source={{ uri: dec.uri }} style={s.thumb} resizeMode="cover" />
+            {dec.mime?.startsWith('video/')
+              ? <View style={[s.thumb,{alignItems:'center',justifyContent:'center'}]}><Text style={{fontSize:32}}>🎬</Text></View>
+              : <Image source={{ uri: dec.uri }} style={s.thumb} resizeMode="cover" />}
           </TouchableOpacity>
         ) : (
           <View style={s.lockTile}>
@@ -194,7 +226,9 @@ export function SharedTab({ onSaveToVault, showToast }) {
       <Sheet visible={!!viewItem} onClose={() => setViewItem(null)}>
         {viewItem && decrypted[viewItem.id] && (
           <View style={{ alignItems: 'center', padding: SPACING.md }}>
-            <Image source={{ uri: decrypted[viewItem.id].uri }} style={s.fullImage} resizeMode="contain" />
+            {decrypted[viewItem.id].mime?.startsWith('video/')
+              ? <Video source={{uri:decrypted[viewItem.id].uri}} style={s.fullImage} useNativeControls resizeMode={ResizeMode.CONTAIN} shouldPlay isLooping={false}/>
+              : <Image source={{ uri: decrypted[viewItem.id].uri }} style={s.fullImage} resizeMode="contain" />}
           </View>
         )}
       </Sheet>

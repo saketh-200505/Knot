@@ -193,14 +193,35 @@ export function Vault({ onLogout }) {
     } catch(e) { toast_('Camera error: ' + e.message, 'error'); }
   };
 
+  // Writes a freshly-sealed file to wherever the vault's primary storage
+  // currently is. If the user has chosen a visible backup folder, files go
+  // straight there (flat — no subfolders, since Expo's SAF createFileAsync
+  // is documented to silently ignore nested folder URIs and always write to
+  // the granted root regardless of which subfolder you pass it
+  // — see github.com/expo/expo/issues/16954). Group ownership is kept clear
+  // via the filename itself instead. Falls back to the original VAULT_DIR
+  // sandbox when no backup folder has been chosen.
+  const writeVaultFile = async (group, id, sealedBytes) => {
+    const b64 = uint8ToBase64(sealedBytes);
+    if (backupDirUri) {
+      const filename = group ? `${group.id}_${id}.dat` : `${id}.dat`;
+      const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, filename, 'application/octet-stream');
+      await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
+      return fileUri;
+    }
+    const dir  = group ? `${VAULT_DIR}${group.id}/` : VAULT_DIR;
+    await ensureDir(dir);
+    const path = `${dir}${id}.dat`;
+    await FileSystem.writeAsStringAsync(path, b64, {encoding:FileSystem.EncodingType.Base64});
+    return path;
+  };
+
   const encryptOne = async (asset, key, salt, group, passphrase) => {
     const b64 = await FileSystem.readAsStringAsync(asset.uri, {encoding:FileSystem.EncodingType.Base64});
     const bytes  = base64ToUint8(b64);
     const sealed = group ? await sealWithKey(bytes, key, salt) : await seal(bytes, passphrase);
     const id     = genId();
-    const dir    = group ? `${VAULT_DIR}${group.id}/` : VAULT_DIR;
-    const path   = `${dir}${id}.dat`;
-    await FileSystem.writeAsStringAsync(path, uint8ToBase64(sealed), {encoding:FileSystem.EncodingType.Base64});
+    const path   = await writeVaultFile(group, id, sealed);
     const isVid  = asset.type==='video' || (asset.mimeType||'').startsWith('video/');
     return {
       id, filePath:path,
@@ -222,8 +243,10 @@ export function Vault({ onLogout }) {
       return;
     }
     setProc(`Encrypting 0 of ${files.length}`);
-    await ensureDir(VAULT_DIR);
-    if (group) await ensureDir(`${VAULT_DIR}${group.id}/`);
+    if (!backupDirUri) {
+      await ensureDir(VAULT_DIR);
+      if (group) await ensureDir(`${VAULT_DIR}${group.id}/`);
+    }
     const salt = group ? base64ToUint8(group.salt) : null;
     const key  = group ? deriveKey(passphrase, salt, DEFAULT_KDF_ITERATIONS) : null;
     let count  = 0;
@@ -538,13 +561,19 @@ export function Vault({ onLogout }) {
   // Copies the raw encrypted .dat (never decrypted) into the chosen visible
   // folder. Prompts to pick a folder first if one hasn't been chosen yet.
   const backupToFolder = async (id) => {
-    const targets = id ? [photos.find(p=>p.id===id)].filter(Boolean) : photos.filter(p=>selected.has(p.id));
-    if (!targets.length) return;
+    const all = id ? [photos.find(p=>p.id===id)].filter(Boolean) : photos.filter(p=>selected.has(p.id));
+    if (!all.length) return;
     let dir = backupDirUri;
     if (!dir) {
       dir = await chooseBackupFolder();
       if (!dir) return; // user cancelled the picker
     }
+    // Anything whose filePath is already a content:// URI was written
+    // straight into the visible folder at encryption time (current default
+    // once a backup folder is set) — copying it again would just create a
+    // pointless duplicate sitting right next to the original.
+    const targets = all.filter(p => !p.filePath.startsWith('content://'));
+    if (!targets.length) { toast_('Already in your visible folder','warn'); setSelectMode(false); setSelected(new Set()); return; }
     setProc(`Saving 0 of ${targets.length}`);
     let count = 0;
     for (let i=0;i<targets.length;i++) {
@@ -567,16 +596,15 @@ export function Vault({ onLogout }) {
     if (count>0) logEvent('backup_to_folder',`${count}`).catch(()=>{});
   };
 
+
   // ── SAVE SHARED TO VAULT ──────────────────────────────────────────────────
   const saveToVault = async (sp, pw, g) => {
     if (!sp) return;
     setProc('Encrypting…');
     try {
-      await ensureDir(VAULT_DIR); await ensureDir(`${VAULT_DIR}${g.id}/`);
       const salt=base64ToUint8(g.salt), key=deriveKey(pw,salt,DEFAULT_KDF_ITERATIONS);
       const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt);
-      const id=genId(), path=`${VAULT_DIR}${g.id}/${id}.dat`;
-      await FileSystem.writeAsStringAsync(path, uint8ToBase64(sealed), {encoding:FileSystem.EncodingType.Base64});
+      const id=genId(), path=await writeVaultFile(g, id, sealed);
       await addPhotoToIndex({id,filePath:path,mimeType:sp.mime||'image/jpeg',mediaType:'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:3,kdfIterations:DEFAULT_KDF_ITERATIONS,groupId:g.id,groupLabel:g.label});
       await loadPhotos(); logEvent('shared_saved_to_vault',g.label).catch(()=>{});
       sp.onDone?.();
@@ -820,7 +848,7 @@ export function Vault({ onLogout }) {
 
       <View style={s.card}>
         <Text style={s.cardTitle}>Backup Folder</Text>
-        <Text style={s.cardDesc}>Where "Save to visible folder" copies encrypted files — visible in any file manager, unlike the app's private storage</Text>
+        <Text style={s.cardDesc}>Once chosen, new encrypted photos are saved here directly — visible in any file manager, unlike the app's private storage. Also where "Save to visible folder" copies older files to.</Text>
         <Text style={{fontFamily:FONTS.mono,color:COLORS.textSecondary,fontSize:11,marginTop:6}} numberOfLines={2}>
           {backupDirUri ? decodeURIComponent(backupDirUri.split('tree/')[1]||backupDirUri) : 'No folder chosen yet'}
         </Text>
@@ -946,8 +974,13 @@ export function Vault({ onLogout }) {
 
       <View style={s.card}>
         <Text style={s.cardTitle}>Vault Storage</Text>
-        <Text style={s.cardDesc}>Encrypted files are stored at:</Text>
-        <Text style={{fontFamily:FONTS.mono,color:COLORS.textSecondary,fontSize:11,marginTop:4}}>{VAULT_DIR}</Text>
+        <Text style={s.cardDesc}>{backupDirUri ? 'New encrypted files are saved directly to:' : 'Encrypted files are stored at:'}</Text>
+        <Text style={{fontFamily:FONTS.mono,color:COLORS.textSecondary,fontSize:11,marginTop:4}} numberOfLines={2}>
+          {backupDirUri ? decodeURIComponent(backupDirUri.split('tree/')[1]||backupDirUri) : VAULT_DIR}
+        </Text>
+        {!!backupDirUri && (
+          <Text style={{fontFamily:FONTS.body,color:COLORS.textMuted,fontSize:11,marginTop:4}}>Older photos encrypted before you chose this folder remain at: {VAULT_DIR}</Text>
+        )}
         <Text style={{fontFamily:FONTS.body,color:COLORS.textMuted,fontSize:11,marginTop:4}}>Use the CLI tool (cli/knot.js) to decrypt files without this app.</Text>
       </View>
 

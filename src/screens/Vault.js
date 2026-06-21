@@ -25,6 +25,7 @@ import {
   storage, KEYS, getSessionDuration, getGesture,
   getGroups, addGroup, findGroupsByFingerprint,
   getAuditLog, clearAuditLog, logEvent,
+  getBackupDirUri, setBackupDirUri,
 } from '../utils/storage';
 import { useSession }  from '../hooks/useSession';
 import { SessionBar }  from '../components/SessionBar';
@@ -150,13 +151,16 @@ export function Vault({ onLogout }) {
 
   const toast_ = useCallback((msg, type='info') => setToast({visible:true, msg, type}), []);
 
+  const [backupDirUri, setBackupDirUriState] = useState(null);
+  const [verifyingBackup, setVerifyingBackup] = useState(false);
+
   const loadPhotos = useCallback(async () => setPhotos(await getPhotoIndex()), []);
   const loadGroups = useCallback(async () => setGroups(await getGroups()), []);
   const loadAudit  = useCallback(async () => setAuditLog(await getAuditLog()), []);
 
   useEffect(() => {
-    Promise.all([getPhotoIndex(), getGroups(), getSessionDuration(), getGesture(), getAuditLog()])
-      .then(([p,g,d,ges,a]) => { setPhotos(p); setGroups(g); setDur(d); setGesture(ges); setAuditLog(a); });
+    Promise.all([getPhotoIndex(), getGroups(), getSessionDuration(), getGesture(), getAuditLog(), getBackupDirUri()])
+      .then(([p,g,d,ges,a,bd]) => { setPhotos(p); setGroups(g); setDur(d); setGesture(ges); setAuditLog(a); setBackupDirUriState(bd); });
   }, []);
   useEffect(() => { if (tab===2) { loadAudit(); loadGroups(); } }, [tab]);
   useEffect(() => { if (session.showExtend) setShowExtend(true); }, [session.showExtend]);
@@ -493,7 +497,74 @@ export function Vault({ onLogout }) {
       {text:'Cancel', style:'cancel'},
       {text:'Encrypted file', onPress:()=>shareEnc(id)},
       {text:'Actual photo', onPress:()=>shareDecrypted(id)},
+      {text:'Save to visible folder', onPress:()=>backupToFolder(id)},
     ]);
+  };
+
+  // Lets the user pick any normal, visible folder (Downloads, a custom
+  // "Knot" folder, etc.) via Android's folder picker, and remembers it.
+  // Unlike Android/data, anything copied here shows up in any file manager —
+  // Android doesn't hide user-chosen SAF folders the way it hides app-private
+  // external storage.
+  const chooseBackupFolder = async () => {
+    if (Platform.OS !== 'android') { toast_('Only available on Android','warn'); return null; }
+    const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+    if (!perm.granted) return null;
+    await setBackupDirUri(perm.directoryUri);
+    setBackupDirUriState(perm.directoryUri);
+    return perm.directoryUri;
+  };
+
+  // Does a real test write + delete against the saved folder so the user
+  // finds out right away if the SAF grant has gone stale (folder deleted,
+  // SD card removed, permission revoked in Android settings) instead of
+  // only discovering it mid-share later.
+  const verifyBackupFolder = async () => {
+    if (!backupDirUri) { toast_('No folder chosen yet','warn'); return; }
+    setVerifyingBackup(true);
+    try {
+      const testUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, `.knot_verify_${Date.now()}`, 'text/plain');
+      await FileSystem.writeAsStringAsync(testUri, 'ok');
+      await FileSystem.StorageAccessFramework.deleteAsync(testUri);
+      toast_('Folder access OK','success');
+    } catch (e) {
+      toast_('Folder access lost — please choose again','error');
+      await setBackupDirUri(null); setBackupDirUriState(null);
+    } finally {
+      setVerifyingBackup(false);
+    }
+  };
+
+  // Copies the raw encrypted .dat (never decrypted) into the chosen visible
+  // folder. Prompts to pick a folder first if one hasn't been chosen yet.
+  const backupToFolder = async (id) => {
+    const targets = id ? [photos.find(p=>p.id===id)].filter(Boolean) : photos.filter(p=>selected.has(p.id));
+    if (!targets.length) return;
+    let dir = backupDirUri;
+    if (!dir) {
+      dir = await chooseBackupFolder();
+      if (!dir) return; // user cancelled the picker
+    }
+    setProc(`Saving 0 of ${targets.length}`);
+    let count = 0;
+    for (let i=0;i<targets.length;i++) {
+      const p = targets[i];
+      setProc(`Saving ${i+1} of ${targets.length}`);
+      try {
+        const b64 = await FileSystem.readAsStringAsync(p.filePath,{encoding:FileSystem.EncodingType.Base64});
+        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, `${p.name||p.id}`, 'application/octet-stream');
+        await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
+        count++;
+      } catch (e) {
+        // SAF permission can be revoked externally (folder deleted/moved) —
+        // if writes start failing, re-prompt for a folder once and bail
+        // rather than silently failing every remaining item.
+        if (i===0) { toast_('Could not write to that folder — pick again from Share','error'); await setBackupDirUri(null); setBackupDirUriState(null); break; }
+      }
+    }
+    setProc(''); setSelectMode(false); setSelected(new Set());
+    count>0 ? toast_(`${count} encrypted file${count!==1?'s':''} saved`,'success') : toast_('Save failed','error');
+    if (count>0) logEvent('backup_to_folder',`${count}`).catch(()=>{});
   };
 
   // ── SAVE SHARED TO VAULT ──────────────────────────────────────────────────
@@ -748,6 +819,31 @@ export function Vault({ onLogout }) {
       </View>
 
       <View style={s.card}>
+        <Text style={s.cardTitle}>Backup Folder</Text>
+        <Text style={s.cardDesc}>Where "Save to visible folder" copies encrypted files — visible in any file manager, unlike the app's private storage</Text>
+        <Text style={{fontFamily:FONTS.mono,color:COLORS.textSecondary,fontSize:11,marginTop:6}} numberOfLines={2}>
+          {backupDirUri ? decodeURIComponent(backupDirUri.split('tree/')[1]||backupDirUri) : 'No folder chosen yet'}
+        </Text>
+        <View style={{flexDirection:'row',gap:8,flexWrap:'wrap',marginTop:8}}>
+          <TouchableOpacity style={s.pill} onPress={chooseBackupFolder} activeOpacity={0.7}>
+            <Text style={s.pillTxt}>{backupDirUri?'Change Folder':'Choose Folder'}</Text>
+          </TouchableOpacity>
+          {!!backupDirUri && (
+            <TouchableOpacity style={s.pill} onPress={verifyBackupFolder} disabled={verifyingBackup} activeOpacity={0.7}>
+              {verifyingBackup
+                ? <ActivityIndicator size="small" color={COLORS.textSecondary}/>
+                : <Text style={s.pillTxt}>Verify Access</Text>}
+            </TouchableOpacity>
+          )}
+          {!!backupDirUri && (
+            <TouchableOpacity style={[s.pill,{borderColor:COLORS.rose}]} onPress={()=>{setBackupDirUri(null);setBackupDirUriState(null);}} activeOpacity={0.7}>
+              <Text style={[s.pillTxt,{color:COLORS.rose}]}>Clear</Text>
+            </TouchableOpacity>
+          )}
+        </View>
+      </View>
+
+      <View style={s.card}>
         <Text style={s.cardTitle}>Secret Sequence</Text>
         <Text style={s.cardDesc}>D-pad pattern to open vault from the game</Text>
         <View style={{flexDirection:'row',flexWrap:'wrap',gap:6,minHeight:36,alignItems:'center',marginTop:4}}>
@@ -892,6 +988,7 @@ export function Vault({ onLogout }) {
         {text:'Cancel', style:'cancel'},
         {text:'Encrypted file', onPress:doShareEnc},
         {text:'Actual photo', onPress:doShare},
+        {text:'Save to visible folder', onPress:()=>backupToFolder(viewPhoto.id)},
       ]);
     };
 

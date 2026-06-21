@@ -10,6 +10,7 @@ const KEYS = {
   GROUPS:          'av_groups',
   AUDIT_LOG:       'av_audit_log',
   IMPORTED_INDEX:  'av_imported_index',
+  BACKUP_DIR_URI:  'av_backup_dir_uri',
 };
 
 export { KEYS };
@@ -151,4 +152,20 @@ export async function updateImportedEntry(id, patch) {
   idx[i] = { ...idx[i], ...patch };
   await saveImportedIndex(idx);
   return idx[i];
+}
+
+// ─── Visible backup folder (Storage Access Framework) ───────────────────────
+// A user-chosen public folder (e.g. Downloads, or a custom "Knot" folder)
+// that encrypted .dat files can be copied into, so they're actually
+// browsable in any file manager — unlike Android/data, which the OS hides
+// from third-party apps on Android 11+. We persist the granted SAF URI so
+// the user only has to pick the folder once.
+export async function getBackupDirUri() {
+  return storage.get(KEYS.BACKUP_DIR_URI);
+}
+export async function setBackupDirUri(uri) {
+  return storage.set(KEYS.BACKUP_DIR_URI, uri);
+}
+export async function clearBackupDirUri() {
+  return storage.remove(KEYS.BACKUP_DIR_URI);
 }

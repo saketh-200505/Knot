@@ -123,25 +123,27 @@ export async function seal(plainBytes, passphrase, options = {}) {
 // so we MUST check this header to detect a bad passphrase.
 export async function unseal(sealedBytes, passphrase, options = {}) {
   if (sealedBytes.length < 33) throw new Error('Invalid sealed data');
-  const iterations = options.iterations || LEGACY_KDF_ITERATIONS;
   const salt       = sealedBytes.slice(0, 16);
   const iv         = sealedBytes.slice(16, 32);
   const ciphertext = sealedBytes.slice(32);
-  const key        = deriveKeySync(passphrase, salt, iterations);
 
-  const aesCtr  = new aesjs.ModeOfOperation.ctr(key, new aesjs.Counter(iv));
-  const decrypted = new Uint8Array(aesCtr.decrypt(ciphertext));
+  // Try every known iteration count in most-likely-first order.
+  // If the caller explicitly passes iterations, honour it and skip the loop.
+  const iterList = options.iterations
+    ? [options.iterations]
+    : [DEFAULT_KDF_ITERATIONS, LEGACY_KDF_ITERATIONS, 8000];
 
-  if (decrypted.length < 36 || !bytesEqual(decrypted.slice(0, 4), MAGIC)) {
-    throw new Error('Wrong passphrase');
+  for (const iterations of iterList) {
+    const key = deriveKeySync(passphrase, salt, iterations);
+    const aesCtr   = new aesjs.ModeOfOperation.ctr(key, new aesjs.Counter(iv));
+    const decrypted = new Uint8Array(aesCtr.decrypt(ciphertext));
+    if (decrypted.length < 36 || !bytesEqual(decrypted.slice(0, 4), MAGIC)) continue;
+    const checksum = decrypted.slice(4, 36);
+    const plain    = decrypted.slice(36);
+    if (!bytesEqual(checksum, sha256(plain))) continue;
+    return plain;   // ← correct key found
   }
-  const checksum = decrypted.slice(4, 36);
-  const plain    = decrypted.slice(36);
-  const actual   = sha256(plain);
-  if (!bytesEqual(checksum, actual)) {
-    throw new Error('Wrong passphrase');
-  }
-  return plain;
+  throw new Error('Wrong passphrase');
 }
 
 // ─── Group fingerprint ────────────────────────────────────────────────────────

@@ -133,6 +133,7 @@ export function Vault({ onLogout }) {
   const [showGroupPick,     setShowGroupPick]     = useState(false);
   const [showNewLabel,      setShowNewLabel]      = useState(false);
   const [newLabel,          setNewLabel]          = useState('');
+  const [newLabelError,     setNewLabelError]     = useState('');
   const [showNewPass,       setShowNewPass]       = useState(false);
   const [showExistingPass,  setShowExistingPass]  = useState(null);
 
@@ -299,7 +300,13 @@ export function Vault({ onLogout }) {
     }
   };
 
-  const confirmNewLabel = () => { if (!newLabel.trim()) return; setShowNewLabel(false); setTimeout(() => setShowNewPass(true), 350); };
+  const confirmNewLabel = () => {
+    if (!newLabel.trim()) return;
+    const duplicate = groups.some(g => g.label.trim().toLowerCase() === newLabel.trim().toLowerCase());
+    if (duplicate) { setNewLabelError(`"${newLabel.trim()}" already exists — choose a different name`); return; }
+    setNewLabelError('');
+    setShowNewLabel(false); setTimeout(() => setShowNewPass(true), 350);
+  };
 
   const confirmNewPass = async (pw) => {
     // Capture files FIRST before any state changes or awaits
@@ -1124,11 +1131,23 @@ export function Vault({ onLogout }) {
 
       <GroupPicker visible={showGroupPick} onClose={()=>{setShowGroupPick(false);setPending([]);}} groups={groups} count={pending.length} onPick={onPickGroup} onCreateNew={onCreateNew}/>
 
-      <Sheet visible={showNewLabel} onClose={()=>{setShowNewLabel(false);setPending([]);setSaveViaNew(false);}}>
+      <Sheet visible={showNewLabel} onClose={()=>{setShowNewLabel(false);setPending([]);setSaveViaNew(false);setNewLabelError('');}}>
         <View style={{padding:SPACING.lg}}>
           <Text style={{fontFamily:FONTS.heading,color:COLORS.textPrimary,fontSize:17,marginBottom:4}}>Name this group</Text>
           <Text style={{fontFamily:FONTS.body,color:COLORS.textSecondary,fontSize:13,marginBottom:SPACING.md}}>e.g. "Goa Trip", "Personal", "Work"</Text>
-          <TextInput style={s.input} placeholder="Group name" placeholderTextColor={COLORS.textMuted} value={newLabel} onChangeText={setNewLabel} autoFocus returnKeyType="next" onSubmitEditing={confirmNewLabel}/>
+          <TextInput
+            style={[s.input, newLabelError ? {borderColor:COLORS.rose,borderWidth:1.5} : null]}
+            placeholder="Group name"
+            placeholderTextColor={COLORS.textMuted}
+            value={newLabel}
+            onChangeText={v=>{setNewLabel(v);if(newLabelError)setNewLabelError('');}}
+            autoFocus
+            returnKeyType="next"
+            onSubmitEditing={confirmNewLabel}
+          />
+          {!!newLabelError && (
+            <Text style={{fontFamily:FONTS.body,color:COLORS.rose,fontSize:12,marginTop:6,marginLeft:2}}>{newLabelError}</Text>
+          )}
           <TouchableOpacity style={[s.solidBtn,{marginTop:8}]} onPress={confirmNewLabel} disabled={!newLabel.trim()} activeOpacity={0.7}>
             <Text style={s.solidBtnTxt}>Next →</Text>
           </TouchableOpacity>

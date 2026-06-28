@@ -23,7 +23,7 @@ import {
 import {
   getPhotoIndex, addPhotoToIndex, removePhotoFromIndex,
   storage, KEYS, getSessionDuration, getGesture,
-  getGroups, addGroup, findGroupsByFingerprint,
+  getGroups, addGroup, findGroupsByFingerprint, removeGroup,
   getAuditLog, clearAuditLog, logEvent,
   getBackupDirUri, setBackupDirUri,
 } from '../utils/storage';
@@ -33,6 +33,7 @@ import { PassSheet }   from '../components/PassSheet';
 import { Sheet }       from '../components/Sheet';
 import { Toast }       from '../components/Toast';
 import { GroupPicker } from '../components/GroupPicker';
+import { ChatTab }     from '../components/ChatTab';
 import { SharedTab }   from '../components/SharedTab';
 import { COLORS, FONTS, RADIUS, SPACING, GROUP_PALETTES } from '../utils/theme';
 import { getExternalVaultDir } from '../../modules/knot-vault-dir';
@@ -57,6 +58,53 @@ function fmt(s)   { const t=Math.max(0,s); return `${Math.floor(t/60)}:${String(
 async function ensureDir(d) {
   const i = await FileSystem.getInfoAsync(d);
   if (!i.exists) await FileSystem.makeDirectoryAsync(d,{intermediates:true});
+}
+
+// ── VIDEO VIEWER (top-level component) ───────────────────────────────────────
+// Must live outside Vault so the session countdown's per-second re-renders
+// don't remount it — a nested component function is recreated on every parent
+// render, which React treats as a brand new component type, causing an
+// unmount+remount that resets the video to position 0 and restarts it.
+const vw = StyleSheet.create({
+  root:      { ...StyleSheet.absoluteFillObject, zIndex:200, elevation:200, backgroundColor:'#000', justifyContent:'center', alignItems:'center' },
+  closeBtn:  { position:'absolute', top:52, right:18, zIndex:210, elevation:210, width:44, height:44, borderRadius:22, backgroundColor:'rgba(255,255,255,0.18)', alignItems:'center', justifyContent:'center' },
+  closeTxt:  { color:'#fff', fontSize:18, fontFamily:FONTS.heading },
+  timer:     { position:'absolute', top:54, left:18, zIndex:210, elevation:210, backgroundColor:'rgba(0,0,0,0.45)', borderRadius:20, paddingHorizontal:12, paddingVertical:5 },
+  timerTxt:  { color:'#fff', fontFamily:FONTS.mono, fontSize:12 },
+  imgWrap:   { position:'absolute', top:0, left:0, right:0, bottom:90, alignItems:'center', justifyContent:'center' },
+  img:       { width:SW, height:SH-90 },
+  bar:       { position:'absolute', bottom:0, left:0, right:0, height:90, flexDirection:'row', alignItems:'center', justifyContent:'center', gap:16, paddingBottom:16, backgroundColor:'rgba(0,0,0,0.55)', zIndex:210, elevation:210 },
+  barBtn:    { backgroundColor:'rgba(255,255,255,0.15)', borderWidth:1, borderColor:'rgba(255,255,255,0.3)', borderRadius:RADIUS.xl, paddingHorizontal:28, paddingVertical:12, minWidth:130, alignItems:'center' },
+  barBtnBlue:{ backgroundColor:COLORS.sky+'CC', borderColor:COLORS.sky },
+  barTxt:    { color:'#fff', fontFamily:FONTS.heading, fontSize:15 },
+});
+
+function VideoViewer({ viewVideo, onClose, remaining, onExport, onShare }) {
+  if (!viewVideo) return null;
+  return (
+    <View style={vw.root}>
+      <TouchableOpacity style={vw.closeBtn} onPress={onClose} hitSlop={{top:16,bottom:16,left:16,right:16}} activeOpacity={0.7}>
+        <Text style={vw.closeTxt}>✕</Text>
+      </TouchableOpacity>
+      <View style={vw.timer} pointerEvents="none"><Text style={vw.timerTxt}>{fmt(remaining)}</Text></View>
+      <Video
+        source={{uri:viewVideo.uri}}
+        style={{width:SW,height:SH*0.65}}
+        useNativeControls
+        resizeMode={ResizeMode.CONTAIN}
+        shouldPlay
+        isLooping={false}
+      />
+      <View style={vw.bar}>
+        <TouchableOpacity style={vw.barBtn} onPress={onExport} activeOpacity={0.7}>
+          <Text style={vw.barTxt}>⬇  Export</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[vw.barBtn,vw.barBtnBlue]} onPress={()=>onShare(viewVideo)} activeOpacity={0.7}>
+          <Text style={vw.barTxt}>↗  Share</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
 }
 
 export function Vault({ onLogout }) {
@@ -163,7 +211,7 @@ export function Vault({ onLogout }) {
     Promise.all([getPhotoIndex(), getGroups(), getSessionDuration(), getGesture(), getAuditLog(), getBackupDirUri()])
       .then(([p,g,d,ges,a,bd]) => { setPhotos(p); setGroups(g); setDur(d); setGesture(ges); setAuditLog(a); setBackupDirUriState(bd); });
   }, []);
-  useEffect(() => { if (tab===2) { loadAudit(); loadGroups(); } }, [tab]);
+  useEffect(() => { if (tab===3) { loadAudit(); loadGroups(); } }, [tab]);
   useEffect(() => { if (session.showExtend) setShowExtend(true); }, [session.showExtend]);
 
   // ── IMPORT ────────────────────────────────────────────────────────────────
@@ -426,6 +474,42 @@ export function Vault({ onLogout }) {
     count>0 ? toast_(`${count} item${count!==1?'s':''} saved to gallery`,'success')
             : toast_('Export failed — check passphrase','error');
     if (count>0) logEvent('export',`${count}`).catch(()=>{});
+  };
+
+  const deleteGroup = (g) => {
+    const gPhotos = photos.filter(p => p.groupId === g.id);
+    Alert.alert(
+      `Delete "${g.label}"?`,
+      gPhotos.length > 0
+        ? `This group has ${gPhotos.length} encrypted photo${gPhotos.length !== 1 ? 's' : ''}.\n\nDelete the group record only (photos stay on disk, encrypted), or delete everything including the encrypted files?`
+        : `Remove the group "${g.label}"? It has no photos.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        ...(gPhotos.length > 0 ? [{
+          text: 'Delete Group Only',
+          onPress: async () => {
+            await removeGroup(g.id);
+            await loadGroups(); await loadPhotos();
+            logEvent('delete_group', g.label).catch(() => {});
+            toast_('Group removed', 'warn');
+          },
+        }] : []),
+        {
+          text: gPhotos.length > 0 ? 'Delete Group + Files' : 'Delete Group',
+          style: 'destructive',
+          onPress: async () => {
+            for (const p of gPhotos) {
+              await FileSystem.deleteAsync(p.filePath, { idempotent: true }).catch(() => {});
+              await removePhotoFromIndex(p.id);
+            }
+            await removeGroup(g.id);
+            await loadGroups(); await loadPhotos();
+            logEvent('delete_group_and_files', g.label).catch(() => {});
+            toast_(`Group and ${gPhotos.length} file${gPhotos.length !== 1 ? 's' : ''} deleted`, 'warn');
+          },
+        },
+      ]
+    );
   };
 
   const deleteSelected = () => {
@@ -953,6 +1037,9 @@ export function Vault({ onLogout }) {
                 <View style={{width:10,height:10,borderRadius:5,backgroundColor:palette.dot}}/>
                 <Text style={{fontFamily:FONTS.bodyMed,color:COLORS.textPrimary,fontSize:13,flex:1}}>{g.label}</Text>
                 <Text style={{fontFamily:FONTS.body,color:COLORS.textSecondary,fontSize:11}}>{n} item{n!==1?'s':''}</Text>
+                <TouchableOpacity onPress={()=>deleteGroup(g)} hitSlop={{top:8,bottom:8,left:8,right:8}} activeOpacity={0.7}>
+                  <Text style={{fontFamily:FONTS.body,color:COLORS.rose,fontSize:12}}>Delete</Text>
+                </TouchableOpacity>
               </View>
             );
           })
@@ -1055,44 +1142,6 @@ export function Vault({ onLogout }) {
   };
 
   // ── VIDEO VIEWER ──────────────────────────────────────────────────────────
-  const VideoViewer = () => {
-    if (!viewVideo) return null;
-    const choosShareVid=()=>{
-      Alert.alert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual video?', [
-        {text:'Cancel', style:'cancel'},
-        {text:'Encrypted file', onPress:()=>{
-          Sharing.isAvailableAsync()
-            .then(ok=>ok&&Sharing.shareAsync(viewVideo.photo.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'}))
-            .then(()=>logEvent('share_encrypted',viewVideo.photo.name).catch(()=>{}))
-            .catch(e=>toast_('Share failed: '+e.message,'error'));
-        }},
-        {text:'Actual video', onPress:()=>{
-          Sharing.isAvailableAsync()
-            .then(ok=>ok&&Sharing.shareAsync(viewVideo.uri,{mimeType:viewVideo.photo.mimeType||'video/mp4'}))
-            .then(()=>logEvent('share_decrypted',viewVideo.photo.name).catch(()=>{}))
-            .catch(e=>toast_('Share failed: '+e.message,'error'));
-        }},
-      ]);
-    };
-    return (
-      <View style={vw.root}>
-        <TouchableOpacity style={vw.closeBtn} onPress={()=>setViewVideo(null)} hitSlop={{top:16,bottom:16,left:16,right:16}} activeOpacity={0.7}>
-          <Text style={vw.closeTxt}>✕</Text>
-        </TouchableOpacity>
-        <View style={vw.timer} pointerEvents="none"><Text style={vw.timerTxt}>{fmt(session.remaining)}</Text></View>
-        <Video source={{uri:viewVideo.uri}} style={{width:SW,height:SH*0.65}} useNativeControls resizeMode={ResizeMode.CONTAIN} shouldPlay isLooping={false}/>
-        <View style={vw.bar}>
-          <TouchableOpacity style={vw.barBtn} onPress={()=>{setExportTarget(viewVideo.photo.id);setViewVideo(null);setShowExport(true);}} activeOpacity={0.7}>
-            <Text style={vw.barTxt}>⬇  Export</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={[vw.barBtn,vw.barBtnBlue]} onPress={choosShareVid} activeOpacity={0.7}>
-            <Text style={vw.barTxt}>↗  Share</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    );
-  };
-
   // ── RENDER ────────────────────────────────────────────────────────────────
   return (
     <View style={s.root}>
@@ -1104,7 +1153,7 @@ export function Vault({ onLogout }) {
           <Text style={s.appName}>My Gallery</Text>
         </View>
         <View style={s.tabTrack}>
-          {['Gallery','Shared','Settings'].map((label,i)=>(
+          {['Gallery','Shared','Chat','Settings'].map((label,i)=>(
             <TouchableOpacity key={label} style={[s.tabBtn,tab===i&&s.tabOn]} onPress={()=>setTab(i)} activeOpacity={0.7}>
               <Text style={[s.tabTxt,tab===i&&s.tabOnTxt]}>{label}</Text>
             </TouchableOpacity>
@@ -1114,11 +1163,24 @@ export function Vault({ onLogout }) {
 
       {tab===0 && <GalleryTab/>}
       {tab===1 && <SharedTab showToast={toast_} onSaveToVault={(b64,mime,name,done)=>setSavePending({plainB64:b64,mime,name,onDone:done})}/>}
-      {tab===2 && <SettingsTab/>}
+      {tab===2 && <ChatTab showToast={toast_} />}
+      {tab===3 && <SettingsTab/>}
 
       {openGroup && <GroupView/>}
       <PhotoViewer/>
-      <VideoViewer/>
+      <VideoViewer
+        viewVideo={viewVideo}
+        onClose={()=>setViewVideo(null)}
+        remaining={session.remaining}
+        onExport={()=>{setExportTarget(viewVideo?.photo.id);setViewVideo(null);setShowExport(true);}}
+        onShare={(vid)=>{
+          Alert.alert('Share','Share the encrypted file or the actual video?',[
+            {text:'Cancel',style:'cancel'},
+            {text:'Encrypted file',onPress:()=>{Sharing.isAvailableAsync().then(ok=>ok&&Sharing.shareAsync(vid.photo.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'})).then(()=>logEvent('share_encrypted',vid.photo.name).catch(()=>{})).catch(e=>toast_('Share failed: '+e.message,'error'));}},
+            {text:'Actual video',onPress:()=>{Sharing.isAvailableAsync().then(ok=>ok&&Sharing.shareAsync(vid.uri,{mimeType:vid.photo.mimeType||'video/mp4'})).then(()=>logEvent('share_decrypted',vid.photo.name).catch(()=>{})).catch(e=>toast_('Share failed: '+e.message,'error'));}}
+          ]);
+        }}
+      />
 
       <PassSheet visible={showUnlock} onClose={()=>{setShowUnlock(false);setUnlockGroup(null);}} onConfirm={handleUnlock}
         title={unlockGroup?`Unlock "${unlockGroup.label}"`:'Unlock'} subtitle="Enter the group passphrase" confirmLabel="Unlock" loading={!!proc}/>
@@ -1260,16 +1322,4 @@ const dv = StyleSheet.create({
   barBtnTxt:{ fontFamily:FONTS.heading, color:'#fff', fontSize:13 },
 });
 
-const vw = StyleSheet.create({
-  root:      { ...StyleSheet.absoluteFillObject, zIndex:200, elevation:200, backgroundColor:'#000', justifyContent:'center', alignItems:'center' },
-  closeBtn:  { position:'absolute', top:52, right:18, zIndex:210, elevation:210, width:44, height:44, borderRadius:22, backgroundColor:'rgba(255,255,255,0.18)', alignItems:'center', justifyContent:'center' },
-  closeTxt:  { color:'#fff', fontSize:18, fontFamily:FONTS.heading },
-  timer:     { position:'absolute', top:54, left:18, zIndex:210, elevation:210, backgroundColor:'rgba(0,0,0,0.45)', borderRadius:20, paddingHorizontal:12, paddingVertical:5 },
-  timerTxt:  { color:'#fff', fontFamily:FONTS.mono, fontSize:12 },
-  imgWrap:   { position:'absolute', top:0, left:0, right:0, bottom:90, alignItems:'center', justifyContent:'center' },
-  img:       { width:SW, height:SH-90 },
-  bar:       { position:'absolute', bottom:0, left:0, right:0, height:90, flexDirection:'row', alignItems:'center', justifyContent:'center', gap:16, paddingBottom:16, backgroundColor:'rgba(0,0,0,0.55)', zIndex:210, elevation:210 },
-  barBtn:    { backgroundColor:'rgba(255,255,255,0.15)', borderWidth:1, borderColor:'rgba(255,255,255,0.3)', borderRadius:RADIUS.xl, paddingHorizontal:28, paddingVertical:12, minWidth:130, alignItems:'center' },
-  barBtnBlue:{ backgroundColor:COLORS.sky+'CC', borderColor:COLORS.sky },
-  barTxt:    { color:'#fff', fontFamily:FONTS.heading, fontSize:15 },
-});
+

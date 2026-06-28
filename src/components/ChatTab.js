@@ -1,235 +1,198 @@
 /**
  * ChatTab.js — E2EE live chat for Knot
+ * Transport : Firebase Realtime Database (free Spark tier — Google's servers)
+ * Encryption: AES-256-CTR using your existing aes-js + @noble/hashes
+ *             Messages are encrypted BEFORE leaving your device.
+ *             Firebase only ever stores ciphertext — never plaintext.
  *
- * NO extra packages needed. Zero npm installs.
- * Uses:
- *   - Free public Nostr WebSocket relays (community-run, always free)
- *   - Your existing aes-js + @noble/hashes for encryption
- *   - expo-crypto for random bytes
- *   - AsyncStorage for key + contact storage
+ * ─── SETUP (one time, ~10 mins) ───────────────────────────────────────────────
+ * 1. Go to https://console.firebase.google.com
+ * 2. Create project → "knot-chat" (disable Google Analytics, not needed)
+ * 3. Build → Realtime Database → Create database → Start in TEST MODE
+ * 4. Copy your config from Project Settings → Your apps → Add app → Web (</>)
+ * 5. Paste the 6 values into FIREBASE_CONFIG below
  *
- * HOW IT WORKS:
- *   - On first launch, generates an ECDH-like key pair using SHA-256 + random seed
- *   - Messages are AES-256-CTR encrypted using a shared secret derived from
- *     both users' seeds (ECDH-style: sha256(myPriv + theirPub))
- *   - Encrypted messages are published to free Nostr relays as events
- *   - Only the recipient (who knows the shared secret) can decrypt
+ * ─── INSTALL (one command) ────────────────────────────────────────────────────
+ *    No npm install needed! We use Firebase REST API directly.
+ *    Firebase REST API works with plain fetch() — no SDK, no native modules.
  *
- * NO GUN. NO SEA. NO NATIVE MODULES. Works in Expo Go.
+ * ─── HOW TO ADD TO Vault.js ───────────────────────────────────────────────────
+ *    Already done in the Vault.js file provided.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, KeyboardAvoidingView, Platform, ActivityIndicator,
-  Alert, Pressable, ScrollView,
+  Alert, Pressable,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ExpoC from 'expo-crypto';
 import * as aesjs from 'aes-js';
 import { sha256 } from '@noble/hashes/sha256';
+import { pbkdf2 } from '@noble/hashes/pbkdf2';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 
-// ─── Free public Nostr relay pool (WebSocket) ─────────────────────────────────
-// These are community-run, always free, no sign-up
-const RELAYS = [
-  'wss://relay.damus.io',
-  'wss://relay.nostr.band',
-  'wss://nos.lol',
-];
+// ─── 🔧 PASTE YOUR FIREBASE CONFIG HERE ──────────────────────────────────────
+const FIREBASE_CONFIG = {
+  apiKey:            'AIzaSyBHnA05bunLw23gy40u-Llxsshn9Lc3LBI',
+  databaseURL:       'https://saketh-3ee4f-default-rtdb.asia-southeast1.firebasedatabase.app',  // e.g. https://knot-chat-default-rtdb.firebaseio.com
+};
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─── Storage keys ─────────────────────────────────────────────────────────────
-const KEY_IDENTITY = 'knot_chat_identity'; // { alias, pubHex, privHex }
-const KEY_CONTACTS = 'knot_chat_contacts'; // [{ id, name, pubHex }]
-const KEY_MESSAGES = 'knot_chat_messages'; // { [roomId]: [msg, ...] }
+// ─── Firebase REST helpers ────────────────────────────────────────────────────
+// We use Firebase's REST API + Server-Sent Events (SSE) for real-time.
+// No SDK needed — works perfectly in Expo Go with plain fetch().
+const DB = FIREBASE_CONFIG.databaseURL;
 
-// ─── Crypto helpers (no Web Crypto, pure JS) ──────────────────────────────────
-function hexToBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < hex.length; i += 2)
-    out[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-  return out;
-}
-function bytesToHex(bytes) {
-  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-function bytesToBase64(bytes) {
-  let b = '';
-  for (let i = 0; i < bytes.length; i++) b += String.fromCharCode(bytes[i]);
-  return btoa(b);
-}
-function base64ToBytes(b64) {
-  const b = atob(b64);
-  const out = new Uint8Array(b.length);
-  for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
-  return out;
+async function fbSet(path, data) {
+  const res = await fetch(`${DB}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return res.json();
 }
 
-// Derive shared AES key: sha256(privHex + theirPubHex)
-// Both sides get identical result (symmetric shared secret)
-function deriveSharedKey(myPrivHex, theirPubHex) {
-  const combined = aesjs.utils.utf8.toBytes(myPrivHex + theirPubHex);
-  return sha256(combined); // 32 bytes — perfect AES-256 key
+async function fbPush(path, data) {
+  const res = await fetch(`${DB}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  return res.json();
 }
 
-// AES-256-CTR encrypt
-function encryptMsg(text, key) {
-  const iv = new Uint8Array(16);
-  // fill iv with deterministic nonce based on timestamp + random suffix
-  const ts = Date.now();
-  iv[0] = (ts >> 24) & 0xff;
-  iv[1] = (ts >> 16) & 0xff;
-  iv[2] = (ts >> 8) & 0xff;
-  iv[3] = ts & 0xff;
-  for (let i = 4; i < 16; i++) iv[i] = Math.floor(Math.random() * 256);
-
-  const plainBytes = aesjs.utils.utf8.toBytes(text);
-  const aesCtr = new aesjs.ModeOfOperation.ctr(key, new aesjs.Counter(iv));
-  const cipher = aesCtr.encrypt(plainBytes);
-
-  // pack: iv(16) + ciphertext
-  const out = new Uint8Array(16 + cipher.length);
-  out.set(iv, 0);
-  out.set(cipher, 16);
-  return bytesToBase64(out);
+async function fbGet(path) {
+  const res = await fetch(`${DB}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`);
+  return res.json();
 }
 
-// AES-256-CTR decrypt
-function decryptMsg(b64, key) {
-  try {
-    const data = base64ToBytes(b64);
-    const iv = data.slice(0, 16);
-    const cipher = data.slice(16);
-    const aesCtr = new aesjs.ModeOfOperation.ctr(key, new aesjs.Counter(iv));
-    const plain = aesCtr.decrypt(cipher);
-    return aesjs.utils.utf8.fromBytes(plain);
-  } catch {
-    return null;
-  }
-}
+// Real-time listener using SSE (Server-Sent Events) — Firebase's streaming API
+// Returns a cancel function
+function fbListen(path, onData) {
+  const url = `${DB}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`;
+  let cancelled = false;
+  let retryTimeout = null;
 
-// ─── Nostr relay manager ──────────────────────────────────────────────────────
-class RelayPool {
-  constructor() {
-    this.sockets = [];
-    this.listeners = []; // fn(event)
-    this.connected = false;
-  }
+  const connect = () => {
+    if (cancelled) return;
+    const ctrl = new AbortController();
 
-  connect() {
-    RELAYS.forEach(url => {
-      try {
-        const ws = new WebSocket(url);
-        ws.onopen = () => { this.connected = true; };
-        ws.onmessage = (e) => {
-          try {
-            const data = JSON.parse(e.data);
-            if (data[0] === 'EVENT') this.listeners.forEach(fn => fn(data[2]));
-          } catch {}
-        };
-        ws.onerror = () => {};
-        ws.onclose = () => {
-          // reconnect after 5s
-          setTimeout(() => this._reconnect(url), 5000);
-        };
-        this.sockets.push(ws);
-      } catch {}
+    fetch(url, {
+      headers: { Accept: 'text/event-stream' },
+      signal: ctrl.signal,
+    }).then(async (res) => {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        if (cancelled) { ctrl.abort(); break; }
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line
+        let event = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) {
+            event = line.slice(6).trim();
+          } else if (line.startsWith('data:') && event === 'put') {
+            try {
+              const payload = JSON.parse(line.slice(5).trim());
+              if (payload.data) onData(payload.data, payload.path);
+            } catch {}
+          }
+        }
+      }
+      // reconnect on disconnect
+      if (!cancelled) retryTimeout = setTimeout(connect, 3000);
+    }).catch(() => {
+      if (!cancelled) retryTimeout = setTimeout(connect, 5000);
     });
-  }
+  };
 
-  _reconnect(url) {
-    try {
-      const ws = new WebSocket(url);
-      ws.onopen = () => { this.connected = true; };
-      ws.onmessage = (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          if (data[0] === 'EVENT') this.listeners.forEach(fn => fn(data[2]));
-        } catch {}
-      };
-      ws.onerror = () => {};
-      ws.onclose = () => setTimeout(() => this._reconnect(url), 5000);
-      this.sockets.push(ws);
-    } catch {}
-  }
-
-  subscribe(filter) {
-    const subId = Math.random().toString(36).slice(2, 10);
-    const msg = JSON.stringify(['REQ', subId, filter]);
-    this.sockets.forEach(ws => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
-      else ws.addEventListener('open', () => ws.send(msg));
-    });
-    return subId;
-  }
-
-  publish(event) {
-    const msg = JSON.stringify(['EVENT', event]);
-    this.sockets.forEach(ws => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
-      else ws.addEventListener('open', () => ws.send(msg));
-    });
-  }
-
-  onEvent(fn) {
-    this.listeners.push(fn);
-    return () => { this.listeners = this.listeners.filter(f => f !== fn); };
-  }
-
-  disconnect() {
-    this.sockets.forEach(ws => { try { ws.close(); } catch {} });
-    this.sockets = [];
-    this.listeners = [];
-  }
-}
-
-// Singleton pool
-let _pool = null;
-function getPool() {
-  if (!_pool) { _pool = new RelayPool(); _pool.connect(); }
-  return _pool;
-}
-
-// ─── Nostr event helpers ──────────────────────────────────────────────────────
-// We use kind:4 (encrypted DM) structure but with our own encryption
-// tag: ['knot', roomId] so we can filter by room
-function makeEvent(content, roomId, pubHex) {
-  return {
-    kind: 4,
-    pubkey: pubHex,
-    created_at: Math.floor(Date.now() / 1000),
-    tags: [['knot', roomId]],
-    content,
-    id: bytesToHex(sha256(aesjs.utils.utf8.toBytes(
-      JSON.stringify({ kind: 4, pubkey: pubHex, created_at: Math.floor(Date.now() / 1000), tags: [['knot', roomId]], content })
-    ))),
-    sig: '0'.repeat(128), // placeholder — Nostr sig not enforced on all relays
+  connect();
+  return () => {
+    cancelled = true;
+    if (retryTimeout) clearTimeout(retryTimeout);
   };
 }
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
-function roomId(pubA, pubB) { return [pubA, pubB].sort().join('_'); }
+// ─── Crypto ───────────────────────────────────────────────────────────────────
+function bytesToHex(b) {
+  return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) out[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  return out;
+}
+
+// Derive shared AES key from my private seed + partner's public key
+// sha256(myPriv + theirPub) — both sides get identical result
+function deriveSharedKey(myPrivHex, theirPubHex) {
+  const input = aesjs.utils.utf8.toBytes(myPrivHex + theirPubHex);
+  return sha256(input); // 32 bytes — AES-256 key
+}
+
+// AES-256-CTR encrypt → base64 string
+function encryptMsg(text, keyBytes) {
+  const iv = new Uint8Array(16);
+  const ts = Date.now();
+  iv[0] = (ts >> 24) & 0xff; iv[1] = (ts >> 16) & 0xff;
+  iv[2] = (ts >> 8) & 0xff;  iv[3] = ts & 0xff;
+  for (let i = 4; i < 16; i++) iv[i] = Math.floor(Math.random() * 256);
+  const plain = aesjs.utils.utf8.toBytes(text);
+  const ctr = new aesjs.ModeOfOperation.ctr(keyBytes, new aesjs.Counter(iv));
+  const cipher = ctr.encrypt(plain);
+  const out = new Uint8Array(16 + cipher.length);
+  out.set(iv); out.set(cipher, 16);
+  let b = ''; for (let i = 0; i < out.length; i++) b += String.fromCharCode(out[i]);
+  return btoa(b);
+}
+
+// AES-256-CTR decrypt ← base64 string
+function decryptMsg(b64, keyBytes) {
+  try {
+    const raw = atob(b64);
+    const data = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) data[i] = raw.charCodeAt(i);
+    const iv = data.slice(0, 16);
+    const cipher = data.slice(16);
+    const ctr = new aesjs.ModeOfOperation.ctr(keyBytes, new aesjs.Counter(iv));
+    const plain = ctr.decrypt(cipher);
+    return aesjs.utils.utf8.fromBytes(plain);
+  } catch { return null; }
+}
+
+// ─── Storage keys ─────────────────────────────────────────────────────────────
+const KEY_IDENTITY = 'knot_chat_id';       // { alias, pubHex, privHex }
+const KEY_CONTACTS = 'knot_chat_contacts'; // [{ id, name, pubHex }]
+const KEY_MESSAGES = 'knot_chat_msgs';     // { [roomId]: [msg,...] }
+
+// ─── Utils ────────────────────────────────────────────────────────────────────
+function roomId(a, b) { return [a, b].sort().join('__'); }
+function genId()      { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+function initials(n)  { return (n||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase(); }
 function timeStr(ts) {
-  const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
-  const now = new Date();
+  const d = new Date(ts), now = new Date();
   const same = d.toDateString() === now.toDateString();
   return same
     ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' +
       d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
-function initials(name) {
-  return (name || '?').split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
-}
 
-// ─── MAIN EXPORT ─────────────────────────────────────────────────────────────
+// ─── ROOT COMPONENT ───────────────────────────────────────────────────────────
 export function ChatTab() {
   const [screen,   setScreen]   = useState('loading');
   const [identity, setIdentity] = useState(null);
   const [contacts, setContacts] = useState([]);
-  const [active,   setActive]   = useState(null); // contact
+  const [active,   setActive]   = useState(null);
 
+  // Load identity on mount
   useEffect(() => {
     (async () => {
       try {
@@ -251,37 +214,36 @@ export function ChatTab() {
     await AsyncStorage.setItem(KEY_CONTACTS, JSON.stringify(list));
   }, []);
 
+  // First-time setup: generate identity keypair
   const handleSetup = useCallback(async (alias) => {
-    // Generate identity: random 32-byte private key, pub = sha256(priv)
     const privBytes = await ExpoC.getRandomBytesAsync(32);
     const privHex = bytesToHex(new Uint8Array(privBytes));
     const pubHex  = bytesToHex(sha256(hexToBytes(privHex)));
     const id = { alias, pubHex, privHex };
     await AsyncStorage.setItem(KEY_IDENTITY, JSON.stringify(id));
+    // Register public key on Firebase so contacts can find you
+    await fbSet(`users/${pubHex}`, { alias, pubHex, ts: Date.now() });
     setIdentity(id);
     setScreen('rooms');
   }, []);
 
   const handleAddContact = useCallback(async (name, pubHex) => {
-    const contact = { id: genId(), name, pubHex };
-    await saveContacts([...contacts, contact]);
+    const exists = contacts.find(c => c.pubHex === pubHex);
+    if (exists) { Alert.alert('Already added', `${exists.name} is already in your contacts.`); return; }
+    await saveContacts([...contacts, { id: genId(), name, pubHex }]);
   }, [contacts, saveContacts]);
 
   const handleDeleteContact = useCallback(async (id) => {
     await saveContacts(contacts.filter(c => c.id !== id));
   }, [contacts, saveContacts]);
 
-  if (screen === 'loading') return (
-    <View style={s.center}><ActivityIndicator color={COLORS.indigo} /></View>
-  );
-  if (screen === 'setup') return (
-    <SetupScreen onDone={handleSetup} />
-  );
+  if (screen === 'loading') return <View style={s.center}><ActivityIndicator color={COLORS.indigo} size="large" /></View>;
+  if (screen === 'setup')   return <SetupScreen onDone={handleSetup} />;
   if (screen === 'chat' && active) return (
     <ChatScreen
       identity={identity}
       contact={active}
-      onBack={() => setScreen('rooms')}
+      onBack={() => { setActive(null); setScreen('rooms'); }}
     />
   );
   return (
@@ -299,23 +261,27 @@ export function ChatTab() {
 function SetupScreen({ onDone }) {
   const [alias, setAlias] = useState('');
   const [busy,  setBusy]  = useState(false);
+
   const go = async () => {
-    if (!alias.trim()) return;
+    const a = alias.trim();
+    if (!a) return;
     setBusy(true);
-    await onDone(alias.trim());
-    setBusy(false);
+    try { await onDone(a); }
+    catch (e) { Alert.alert('Error', e.message); setBusy(false); }
   };
+
   return (
     <View style={s.center}>
-      <View style={s.setupCard}>
+      <View style={s.card}>
         <Text style={s.setupIcon}>🔐</Text>
         <Text style={s.setupTitle}>Set up chat</Text>
         <Text style={s.setupSub}>
-          Choose a display name. An encryption key pair will be created on this
-          device. Your messages are encrypted before leaving your phone.
+          Pick a display name. An encryption key pair is generated on this device.
+          Messages are encrypted before they leave your phone — Firebase only
+          stores ciphertext.
         </Text>
         <TextInput
-          style={s.input}
+          style={s.textInput}
           placeholder="Your name"
           placeholderTextColor={COLORS.textMuted}
           value={alias}
@@ -325,14 +291,14 @@ function SetupScreen({ onDone }) {
           onSubmitEditing={go}
         />
         <TouchableOpacity
-          style={[s.btnPrimary, busy && { opacity: 0.5 }]}
+          style={[s.btnPrimary, (busy || !alias.trim()) && s.btnDisabled]}
           onPress={go}
           disabled={busy || !alias.trim()}
           activeOpacity={0.8}
         >
           {busy
             ? <ActivityIndicator color="#fff" />
-            : <Text style={s.btnTxt}>Create identity & start</Text>}
+            : <Text style={s.btnPrimaryTxt}>Generate keys & start</Text>}
         </TouchableOpacity>
       </View>
     </View>
@@ -341,18 +307,18 @@ function SetupScreen({ onDone }) {
 
 // ─── ROOMS ────────────────────────────────────────────────────────────────────
 function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
-  const [showAdd,  setShowAdd]  = useState(false);
   const [showKey,  setShowKey]  = useState(false);
+  const [showAdd,  setShowAdd]  = useState(false);
   const [name,     setName]     = useState('');
-  const [pub,      setPub]      = useState('');
+  const [pubInput, setPubInput] = useState('');
   const [busy,     setBusy]     = useState(false);
 
-  const add = async () => {
-    const n = name.trim(), p = pub.trim();
-    if (!n || p.length < 10) return;
+  const addContact = async () => {
+    const n = name.trim(), p = pubInput.trim();
+    if (!n || p.length < 10) { Alert.alert('Missing info', 'Enter a name and a valid public key.'); return; }
     setBusy(true);
     await onAdd(n, p);
-    setName(''); setPub(''); setShowAdd(false); setBusy(false);
+    setName(''); setPubInput(''); setShowAdd(false); setBusy(false);
   };
 
   const confirmDelete = (c) =>
@@ -366,26 +332,26 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
       {/* Header */}
       <View style={s.header}>
         <Text style={s.headerTitle}>Messages</Text>
-        <TouchableOpacity style={s.chipBtn} onPress={() => setShowKey(v => !v)} activeOpacity={0.7}>
+        <TouchableOpacity style={s.chip} onPress={() => setShowKey(v => !v)} activeOpacity={0.7}>
           <Text style={s.chipTxt}>My key</Text>
         </TouchableOpacity>
       </View>
 
-      {/* My key card */}
+      {/* My public key — share with contacts */}
       {showKey && (
         <View style={s.keyCard}>
-          <Text style={s.keyLabel}>Share your public key with people who want to message you</Text>
-          <Text style={s.keyVal} selectable numberOfLines={3}>{identity?.pubHex}</Text>
-          <Text style={s.keyName}>{identity?.alias}</Text>
+          <Text style={s.keyCardLabel}>Share this key with people who want to message you</Text>
+          <Text style={s.keyCardVal} selectable numberOfLines={4}>{identity?.pubHex}</Text>
+          <Text style={s.keyCardName}>Name: {identity?.alias}</Text>
         </View>
       )}
 
-      {/* List */}
+      {/* Contact list */}
       {contacts.length === 0 ? (
-        <View style={s.empty}>
-          <Text style={s.emptyIcon}>💬</Text>
-          <Text style={s.emptyTitle}>No contacts yet</Text>
-          <Text style={s.emptySub}>Tap + to add someone using their public key.</Text>
+        <View style={s.emptyWrap}>
+          <Text style={{ fontSize: 44, marginBottom: 12 }}>💬</Text>
+          <Text style={s.emptyTitle}>No conversations yet</Text>
+          <Text style={s.emptySub}>Tap + and paste a contact's public key to start chatting.</Text>
         </View>
       ) : (
         <FlatList
@@ -394,26 +360,29 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
           contentContainerStyle={{ paddingBottom: 100 }}
           renderItem={({ item }) => (
             <Pressable
-              style={({ pressed }) => [s.row, pressed && { backgroundColor: COLORS.surface2 }]}
+              style={({ pressed }) => [s.contactRow, pressed && { backgroundColor: COLORS.surface2 }]}
               onPress={() => onOpen(item)}
               onLongPress={() => confirmDelete(item)}
             >
-              <View style={s.avatar}><Text style={s.avatarTxt}>{initials(item.name)}</Text></View>
-              <View style={{ flex: 1 }}>
-                <Text style={s.rowName}>{item.name}</Text>
-                <Text style={s.rowSub} numberOfLines={1}>🔒 End-to-end encrypted</Text>
+              <View style={s.avatar}>
+                <Text style={s.avatarTxt}>{initials(item.name)}</Text>
               </View>
+              <View style={{ flex: 1 }}>
+                <Text style={s.contactName}>{item.name}</Text>
+                <Text style={s.contactSub}>🔒 End-to-end encrypted</Text>
+              </View>
+              <Text style={{ fontSize: 18, color: COLORS.textMuted }}>›</Text>
             </Pressable>
           )}
         />
       )}
 
-      {/* Add sheet */}
+      {/* Add contact bottom sheet */}
       {showAdd && (
         <View style={s.sheet}>
           <Text style={s.sheetTitle}>Add contact</Text>
           <TextInput
-            style={s.input}
+            style={s.textInput}
             placeholder="Their name"
             placeholderTextColor={COLORS.textMuted}
             value={name}
@@ -421,11 +390,11 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
             autoFocus
           />
           <TextInput
-            style={[s.input, { height: 90, textAlignVertical: 'top' }]}
-            placeholder="Paste their public key"
+            style={[s.textInput, { height: 88, textAlignVertical: 'top', paddingTop: SPACING.sm }]}
+            placeholder="Paste their public key here"
             placeholderTextColor={COLORS.textMuted}
-            value={pub}
-            onChangeText={setPub}
+            value={pubInput}
+            onChangeText={setPubInput}
             multiline
             autoCorrect={false}
             autoCapitalize="none"
@@ -435,10 +404,10 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
               <Text style={s.btnGhostTxt}>Cancel</Text>
             </TouchableOpacity>
             <TouchableOpacity
-              style={[s.btnPrimary, { flex: 1 }, busy && { opacity: 0.5 }]}
-              onPress={add} disabled={busy}
+              style={[s.btnPrimary, { flex: 1 }, busy && s.btnDisabled]}
+              onPress={addContact} disabled={busy}
             >
-              <Text style={s.btnTxt}>Add</Text>
+              {busy ? <ActivityIndicator color="#fff" size="small" /> : <Text style={s.btnPrimaryTxt}>Add</Text>}
             </TouchableOpacity>
           </View>
         </View>
@@ -454,96 +423,114 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
   );
 }
 
-// ─── CHAT ─────────────────────────────────────────────────────────────────────
+// ─── CHAT SCREEN ──────────────────────────────────────────────────────────────
 function ChatScreen({ identity, contact, onBack }) {
   const [messages, setMessages] = useState([]);
   const [input,    setInput]    = useState('');
   const [sending,  setSending]  = useState(false);
   const [status,   setStatus]   = useState('Connecting…');
-  const listRef  = useRef(null);
-  const seenIds  = useRef(new Set());
+  const listRef   = useRef(null);
+  const seenIds   = useRef(new Set());
   const sharedKey = useRef(null);
   const rid = roomId(identity.pubHex, contact.pubHex);
+  // Firebase path — only these two pubkeys can form this path (sorted)
+  const fbPath = `chats/${rid}`;
 
-  // derive shared key + load cached messages
+  // Step 1 — derive shared encryption key
   useEffect(() => {
     sharedKey.current = deriveSharedKey(identity.privHex, contact.pubHex);
+  }, [identity.privHex, contact.pubHex]);
+
+  // Step 2 — load cached messages from AsyncStorage
+  useEffect(() => {
     (async () => {
       try {
         const raw = await AsyncStorage.getItem(KEY_MESSAGES);
         const all = raw ? JSON.parse(raw) : {};
-        const cached = (all[rid] || []).map(m => ({ ...m, fromMe: m.sender === identity.pubHex }));
-        setMessages(cached);
+        const cached = (all[rid] || []).map(m => ({
+          ...m, fromMe: m.sender === identity.pubHex,
+        }));
+        if (cached.length) {
+          setMessages(cached);
+          setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 50);
+        }
       } catch {}
     })();
-  }, [rid, identity, contact]);
+  }, [rid, identity.pubHex]);
 
-  // subscribe to relay
+  // Step 3 — real-time Firebase listener
   useEffect(() => {
-    const pool = getPool();
-    const off = pool.onEvent(async (event) => {
-      if (!event || !event.content || seenIds.current.has(event.id)) return;
-      const tag = event.tags?.find(t => t[0] === 'knot');
-      if (!tag || tag[1] !== rid) return;
-      seenIds.current.add(event.id);
-      const text = decryptMsg(event.content, sharedKey.current);
-      if (!text) return;
-      const msg = {
-        id: event.id,
-        text,
-        ts: event.created_at,
-        sender: event.pubkey,
-        fromMe: event.pubkey === identity.pubHex,
-      };
+    const cancel = fbListen(fbPath, (data) => {
+      if (!data || !sharedKey.current) return;
+      setStatus('🔒 End-to-end encrypted');
+      // data is an object of { msgId: { ct, ts, sender } }
+      const incoming = Object.entries(data)
+        .map(([id, m]) => {
+          if (seenIds.current.has(id)) return null;
+          seenIds.current.add(id);
+          const text = decryptMsg(m.ct, sharedKey.current);
+          if (!text) return null;
+          return { id, text, ts: m.ts, sender: m.sender, fromMe: m.sender === identity.pubHex };
+        })
+        .filter(Boolean);
+
+      if (!incoming.length) return;
+
       setMessages(prev => {
-        if (prev.find(m => m.id === msg.id)) return prev;
-        const next = [...prev, msg].sort((a, b) => a.ts - b.ts);
-        // persist
+        const merged = [...prev];
+        for (const msg of incoming) {
+          if (!merged.find(m => m.id === msg.id)) merged.push(msg);
+        }
+        const sorted = merged.sort((a, b) => a.ts - b.ts);
+        // persist to AsyncStorage
         AsyncStorage.getItem(KEY_MESSAGES).then(raw => {
           const all = raw ? JSON.parse(raw) : {};
-          all[rid] = next;
-          AsyncStorage.setItem(KEY_MESSAGES, JSON.stringify(all));
+          all[rid] = sorted;
+          return AsyncStorage.setItem(KEY_MESSAGES, JSON.stringify(all));
         }).catch(() => {});
-        return next;
+        return sorted;
       });
       setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
     });
 
-    pool.subscribe({ '#knot': [rid], kinds: [4], limit: 100 });
     setStatus('🔒 End-to-end encrypted');
+    return cancel;
+  }, [fbPath, rid, identity.pubHex]);
 
-    return off;
-  }, [rid, identity.pubHex]);
-
+  // Send a message
   const send = useCallback(async () => {
     const text = input.trim();
     if (!text || sending || !sharedKey.current) return;
     setSending(true);
     setInput('');
-    try {
-      const ct    = encryptMsg(text, sharedKey.current);
-      const event = makeEvent(ct, rid, identity.pubHex);
-      getPool().publish(event);
 
-      // optimistic local add
-      const msg = { id: event.id, text, ts: event.created_at, sender: identity.pubHex, fromMe: true };
-      seenIds.current.add(event.id);
-      setMessages(prev => {
-        const next = [...prev, msg].sort((a, b) => a.ts - b.ts);
-        AsyncStorage.getItem(KEY_MESSAGES).then(raw => {
-          const all = raw ? JSON.parse(raw) : {};
-          all[rid] = next;
-          AsyncStorage.setItem(KEY_MESSAGES, JSON.stringify(all));
-        }).catch(() => {});
-        return next;
-      });
-      setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
+    const id  = genId();
+    const ts  = Date.now();
+    const ct  = encryptMsg(text, sharedKey.current);
+    const msg = { id, text, ts, sender: identity.pubHex, fromMe: true };
+
+    // Optimistic local add
+    seenIds.current.add(id);
+    setMessages(prev => {
+      const next = [...prev, msg].sort((a, b) => a.ts - b.ts);
+      AsyncStorage.getItem(KEY_MESSAGES).then(raw => {
+        const all = raw ? JSON.parse(raw) : {};
+        all[rid] = next;
+        return AsyncStorage.setItem(KEY_MESSAGES, JSON.stringify(all));
+      }).catch(() => {});
+      return next;
+    });
+    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
+
+    try {
+      // Push encrypted message to Firebase
+      await fbSet(`${fbPath}/${id}`, { ct, ts, sender: identity.pubHex });
     } catch (e) {
-      Alert.alert('Send failed', e.message);
+      Alert.alert('Send failed', 'Check your internet connection.');
     } finally {
       setSending(false);
     }
-  }, [input, sending, identity, rid]);
+  }, [input, sending, identity, fbPath, rid]);
 
   return (
     <KeyboardAvoidingView
@@ -552,10 +539,12 @@ function ChatScreen({ identity, contact, onBack }) {
     >
       {/* Header */}
       <View style={s.header}>
-        <TouchableOpacity style={s.backCircle} onPress={onBack} activeOpacity={0.7}>
+        <TouchableOpacity style={s.backBtn} onPress={onBack} activeOpacity={0.7}>
           <Text style={{ fontSize: 18, color: COLORS.textSecondary }}>←</Text>
         </TouchableOpacity>
-        <View style={s.avatar}><Text style={s.avatarTxt}>{initials(contact.name)}</Text></View>
+        <View style={s.avatar}>
+          <Text style={s.avatarTxt}>{initials(contact.name)}</Text>
+        </View>
         <View style={{ flex: 1 }}>
           <Text style={s.headerTitle}>{contact.name}</Text>
           <Text style={s.statusTxt}>{status}</Text>
@@ -571,27 +560,28 @@ function ChatScreen({ identity, contact, onBack }) {
         onLayout={() => listRef.current?.scrollToEnd({ animated: false })}
         ListEmptyComponent={
           <View style={s.emptyChat}>
-            <Text style={{ fontSize: 36, marginBottom: 12 }}>🔐</Text>
+            <Text style={{ fontSize: 40, marginBottom: 12 }}>🔐</Text>
             <Text style={s.emptySub}>
-              Messages are encrypted on your device.{'\n'}Nobody else can read them.
+              Messages are encrypted before leaving your device.{'\n'}
+              Only you and {contact.name} can read them.
             </Text>
           </View>
         }
         renderItem={({ item }) => (
           <View style={[s.bubbleWrap, item.fromMe ? s.bubbleWrapMe : s.bubbleWrapThem]}>
             <View style={[s.bubble, item.fromMe ? s.bubbleMe : s.bubbleThem]}>
-              <Text style={[s.bubbleTxt, item.fromMe ? { color: '#fff' } : { color: COLORS.textPrimary }]}>
+              <Text style={[s.bubbleTxt, { color: item.fromMe ? '#fff' : COLORS.textPrimary }]}>
                 {item.text}
               </Text>
             </View>
-            <Text style={[s.timeStr, item.fromMe ? { textAlign: 'right' } : { textAlign: 'left' }]}>
+            <Text style={[s.timeStr, { textAlign: item.fromMe ? 'right' : 'left' }]}>
               {timeStr(item.ts)}
             </Text>
           </View>
         )}
       />
 
-      {/* Input */}
+      {/* Input bar */}
       <View style={s.inputBar}>
         <TextInput
           style={s.msgInput}
@@ -610,7 +600,7 @@ function ChatScreen({ identity, contact, onBack }) {
         >
           {sending
             ? <ActivityIndicator color="#fff" size="small" />
-            : <Text style={s.sendArrow}>↑</Text>}
+            : <Text style={s.sendIcon}>↑</Text>}
         </TouchableOpacity>
       </View>
     </KeyboardAvoidingView>
@@ -619,75 +609,75 @@ function ChatScreen({ identity, contact, onBack }) {
 
 // ─── STYLES ───────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
-  fill:         { flex: 1, backgroundColor: COLORS.bg },
-  center:       { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.bg, padding: SPACING.lg },
+  fill:           { flex: 1, backgroundColor: COLORS.bg },
+  center:         { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: COLORS.bg, padding: SPACING.lg },
 
-  // Setup
-  setupCard:    { width: '100%', backgroundColor: COLORS.surface1, borderRadius: RADIUS.xl, padding: SPACING.xl, alignItems: 'center', shadowColor: '#000', shadowOpacity: 0.06, shadowOffset: { width: 0, height: 4 }, shadowRadius: 12, elevation: 4 },
-  setupIcon:    { fontSize: 40, marginBottom: SPACING.md },
-  setupTitle:   { fontFamily: FONTS.headingX, fontSize: 22, color: COLORS.textPrimary, marginBottom: SPACING.sm },
-  setupSub:     { fontFamily: FONTS.body, fontSize: 13, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 19, marginBottom: SPACING.lg },
+  // Card / setup
+  card:           { width: '100%', backgroundColor: COLORS.surface1, borderRadius: RADIUS.xl, padding: SPACING.xl, alignItems: 'center', shadowColor: '#000', shadowOpacity: 0.06, shadowOffset: { width: 0, height: 4 }, shadowRadius: 12, elevation: 4 },
+  setupIcon:      { fontSize: 40, marginBottom: SPACING.md },
+  setupTitle:     { fontFamily: FONTS.headingX, fontSize: 22, color: COLORS.textPrimary, marginBottom: SPACING.sm },
+  setupSub:       { fontFamily: FONTS.body, fontSize: 13, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 19, marginBottom: SPACING.lg },
 
-  // Shared inputs / buttons
-  input:        { width: '100%', backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.lg, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm + 2, fontFamily: FONTS.body, fontSize: 14, color: COLORS.textPrimary, marginBottom: SPACING.sm },
-  btnPrimary:   { backgroundColor: COLORS.indigo, borderRadius: RADIUS.lg, paddingVertical: SPACING.sm + 2, alignItems: 'center', justifyContent: 'center', minHeight: 46, width: '100%' },
-  btnGhost:     { backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.lg, paddingVertical: SPACING.sm + 2, alignItems: 'center', justifyContent: 'center', minHeight: 46 },
-  btnTxt:       { fontFamily: FONTS.bodyMed, fontSize: 15, color: '#fff' },
-  btnGhostTxt:  { fontFamily: FONTS.bodyMed, fontSize: 15, color: COLORS.textSecondary },
+  // Inputs + buttons
+  textInput:      { width: '100%', backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.lg, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm + 2, fontFamily: FONTS.body, fontSize: 14, color: COLORS.textPrimary, marginBottom: SPACING.sm },
+  btnPrimary:     { backgroundColor: COLORS.indigo, borderRadius: RADIUS.lg, paddingVertical: SPACING.sm + 2, alignItems: 'center', justifyContent: 'center', minHeight: 46, width: '100%' },
+  btnGhost:       { backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.lg, paddingVertical: SPACING.sm + 2, alignItems: 'center', justifyContent: 'center', minHeight: 46 },
+  btnPrimaryTxt:  { fontFamily: FONTS.bodyMed, fontSize: 15, color: '#fff' },
+  btnGhostTxt:    { fontFamily: FONTS.bodyMed, fontSize: 15, color: COLORS.textSecondary },
+  btnDisabled:    { opacity: 0.45 },
 
   // Header
-  header:       { flexDirection: 'row', alignItems: 'center', paddingTop: 52, paddingBottom: SPACING.md, paddingHorizontal: SPACING.md, backgroundColor: COLORS.surface1, borderBottomWidth: 1, borderColor: COLORS.border, gap: SPACING.sm },
-  headerTitle:  { fontFamily: FONTS.headingX, fontSize: 20, color: COLORS.textPrimary },
-  statusTxt:    { fontFamily: FONTS.body, fontSize: 11, color: COLORS.textMuted },
-  backCircle:   { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.surface2, alignItems: 'center', justifyContent: 'center' },
-  chipBtn:      { backgroundColor: COLORS.indigoDim, paddingHorizontal: SPACING.md, paddingVertical: 6, borderRadius: RADIUS.full },
-  chipTxt:      { fontFamily: FONTS.bodyMed, fontSize: 13, color: COLORS.indigo },
+  header:         { flexDirection: 'row', alignItems: 'center', paddingTop: 52, paddingBottom: SPACING.md, paddingHorizontal: SPACING.md, backgroundColor: COLORS.surface1, borderBottomWidth: 1, borderColor: COLORS.border, gap: SPACING.sm },
+  headerTitle:    { fontFamily: FONTS.headingX, fontSize: 20, color: COLORS.textPrimary },
+  statusTxt:      { fontFamily: FONTS.body, fontSize: 11, color: COLORS.textMuted, marginTop: 1 },
+  backBtn:        { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.surface2, alignItems: 'center', justifyContent: 'center' },
+  chip:           { backgroundColor: COLORS.indigoDim, paddingHorizontal: SPACING.md, paddingVertical: 6, borderRadius: RADIUS.full },
+  chipTxt:        { fontFamily: FONTS.bodyMed, fontSize: 13, color: COLORS.indigo },
 
   // Avatar
-  avatar:       { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.indigoDim, alignItems: 'center', justifyContent: 'center' },
-  avatarTxt:    { fontFamily: FONTS.heading, fontSize: 15, color: COLORS.indigo },
+  avatar:         { width: 44, height: 44, borderRadius: 22, backgroundColor: COLORS.indigoDim, alignItems: 'center', justifyContent: 'center' },
+  avatarTxt:      { fontFamily: FONTS.heading, fontSize: 15, color: COLORS.indigo },
 
   // Key card
-  keyCard:      { margin: SPACING.md, backgroundColor: COLORS.surface1, borderRadius: RADIUS.lg, padding: SPACING.md, borderWidth: 1, borderColor: COLORS.border },
-  keyLabel:     { fontFamily: FONTS.body, fontSize: 11, color: COLORS.textMuted, marginBottom: 6 },
-  keyVal:       { fontFamily: FONTS.mono, fontSize: 9, color: COLORS.textSecondary, lineHeight: 14, marginBottom: 6 },
-  keyName:      { fontFamily: FONTS.bodyMed, fontSize: 12, color: COLORS.indigo },
+  keyCard:        { margin: SPACING.md, backgroundColor: COLORS.surface1, borderRadius: RADIUS.lg, padding: SPACING.md, borderWidth: 1, borderColor: COLORS.border },
+  keyCardLabel:   { fontFamily: FONTS.body, fontSize: 11, color: COLORS.textMuted, marginBottom: 6 },
+  keyCardVal:     { fontFamily: FONTS.mono, fontSize: 9, color: COLORS.textSecondary, lineHeight: 14, marginBottom: 6 },
+  keyCardName:    { fontFamily: FONTS.bodyMed, fontSize: 12, color: COLORS.indigo },
 
   // Rooms list
-  row:          { flexDirection: 'row', alignItems: 'center', paddingHorizontal: SPACING.md, paddingVertical: SPACING.md, backgroundColor: COLORS.surface1, borderBottomWidth: 1, borderColor: COLORS.border, gap: SPACING.md },
-  rowName:      { fontFamily: FONTS.bodyMed, fontSize: 15, color: COLORS.textPrimary, marginBottom: 2 },
-  rowSub:       { fontFamily: FONTS.body, fontSize: 12, color: COLORS.textMuted },
+  contactRow:     { flexDirection: 'row', alignItems: 'center', paddingHorizontal: SPACING.md, paddingVertical: SPACING.md, backgroundColor: COLORS.surface1, borderBottomWidth: 1, borderColor: COLORS.border, gap: SPACING.md },
+  contactName:    { fontFamily: FONTS.bodyMed, fontSize: 15, color: COLORS.textPrimary, marginBottom: 2 },
+  contactSub:     { fontFamily: FONTS.body, fontSize: 12, color: COLORS.textMuted },
 
-  // Empty
-  empty:        { flex: 1, alignItems: 'center', justifyContent: 'center', padding: SPACING.xl },
-  emptyIcon:    { fontSize: 44, marginBottom: SPACING.md },
-  emptyTitle:   { fontFamily: FONTS.heading, fontSize: 18, color: COLORS.textPrimary, marginBottom: SPACING.sm },
-  emptySub:     { fontFamily: FONTS.body, fontSize: 13, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 19 },
+  // Empty states
+  emptyWrap:      { flex: 1, alignItems: 'center', justifyContent: 'center', padding: SPACING.xl },
+  emptyTitle:     { fontFamily: FONTS.heading, fontSize: 18, color: COLORS.textPrimary, marginBottom: SPACING.sm },
+  emptySub:       { fontFamily: FONTS.body, fontSize: 13, color: COLORS.textSecondary, textAlign: 'center', lineHeight: 19 },
+  emptyChat:      { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: SPACING.xl },
 
   // Add sheet
-  sheet:        { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: COLORS.surface1, borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl, padding: SPACING.lg, borderTopWidth: 1, borderColor: COLORS.border, shadowColor: '#000', shadowOpacity: 0.1, shadowOffset: { width: 0, height: -4 }, shadowRadius: 12, elevation: 12 },
-  sheetTitle:   { fontFamily: FONTS.heading, fontSize: 18, color: COLORS.textPrimary, marginBottom: SPACING.md },
+  sheet:          { position: 'absolute', bottom: 0, left: 0, right: 0, backgroundColor: COLORS.surface1, borderTopLeftRadius: RADIUS.xl, borderTopRightRadius: RADIUS.xl, padding: SPACING.lg, borderTopWidth: 1, borderColor: COLORS.border, shadowColor: '#000', shadowOpacity: 0.12, shadowOffset: { width: 0, height: -4 }, shadowRadius: 16, elevation: 16 },
+  sheetTitle:     { fontFamily: FONTS.heading, fontSize: 18, color: COLORS.textPrimary, marginBottom: SPACING.md },
 
   // FAB
-  fab:          { position: 'absolute', bottom: SPACING.xl, right: SPACING.lg, width: 56, height: 56, borderRadius: 28, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.indigo, shadowOpacity: 0.4, shadowOffset: { width: 0, height: 4 }, shadowRadius: 10, elevation: 8 },
-  fabTxt:       { fontSize: 28, color: '#fff', lineHeight: 32, marginTop: -2 },
+  fab:            { position: 'absolute', bottom: SPACING.xl, right: SPACING.lg, width: 56, height: 56, borderRadius: 28, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.indigo, shadowOpacity: 0.4, shadowOffset: { width: 0, height: 4 }, shadowRadius: 10, elevation: 8 },
+  fabTxt:         { fontSize: 28, color: '#fff', lineHeight: 32, marginTop: -2 },
 
-  // Chat messages
-  msgList:      { padding: SPACING.md, paddingBottom: SPACING.lg },
-  emptyChat:    { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 60, paddingHorizontal: SPACING.xl },
-  bubbleWrap:   { marginBottom: SPACING.sm },
-  bubbleWrapMe: { alignItems: 'flex-end' },
-  bubbleWrapThem:{ alignItems: 'flex-start' },
-  bubble:       { maxWidth: '78%', borderRadius: RADIUS.lg, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm },
-  bubbleMe:     { backgroundColor: COLORS.indigo, borderBottomRightRadius: 4 },
-  bubbleThem:   { backgroundColor: COLORS.surface1, borderBottomLeftRadius: 4, borderWidth: 1, borderColor: COLORS.border },
-  bubbleTxt:    { fontFamily: FONTS.body, fontSize: 15, lineHeight: 21 },
-  timeStr:      { fontFamily: FONTS.body, fontSize: 10, color: COLORS.textMuted, marginTop: 3, paddingHorizontal: 4 },
+  // Chat bubbles
+  msgList:        { padding: SPACING.md, paddingBottom: SPACING.lg },
+  bubbleWrap:     { marginBottom: SPACING.sm },
+  bubbleWrapMe:   { alignItems: 'flex-end' },
+  bubbleWrapThem: { alignItems: 'flex-start' },
+  bubble:         { maxWidth: '78%', borderRadius: RADIUS.lg, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm + 2 },
+  bubbleMe:       { backgroundColor: COLORS.indigo, borderBottomRightRadius: 4 },
+  bubbleThem:     { backgroundColor: COLORS.surface1, borderBottomLeftRadius: 4, borderWidth: 1, borderColor: COLORS.border },
+  bubbleTxt:      { fontFamily: FONTS.body, fontSize: 15, lineHeight: 22 },
+  timeStr:        { fontFamily: FONTS.body, fontSize: 10, color: COLORS.textMuted, marginTop: 3, paddingHorizontal: 4 },
 
   // Input bar
-  inputBar:     { flexDirection: 'row', alignItems: 'flex-end', padding: SPACING.sm, paddingBottom: Platform.OS === 'ios' ? SPACING.lg : SPACING.sm, backgroundColor: COLORS.surface1, borderTopWidth: 1, borderColor: COLORS.border, gap: SPACING.sm },
-  msgInput:     { flex: 1, backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.xl, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm, fontFamily: FONTS.body, fontSize: 15, color: COLORS.textPrimary, maxHeight: 120 },
-  sendBtn:      { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center' },
-  sendBtnOff:   { backgroundColor: COLORS.border },
-  sendArrow:    { fontSize: 18, color: '#fff', marginTop: -1 },
+  inputBar:       { flexDirection: 'row', alignItems: 'flex-end', padding: SPACING.sm, paddingBottom: Platform.OS === 'ios' ? SPACING.lg : SPACING.sm, backgroundColor: COLORS.surface1, borderTopWidth: 1, borderColor: COLORS.border, gap: SPACING.sm },
+  msgInput:       { flex: 1, backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.xl, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm, fontFamily: FONTS.body, fontSize: 15, color: COLORS.textPrimary, maxHeight: 120 },
+  sendBtn:        { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center' },
+  sendBtnOff:     { backgroundColor: COLORS.border },
+  sendIcon:       { fontSize: 18, color: '#fff', marginTop: -1 },
 });

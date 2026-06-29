@@ -14,6 +14,7 @@
     "@expo-google-fonts/dm-sans": "^0.2.3",
     "@expo-google-fonts/space-mono": "^0.2.3",
     "@expo-google-fonts/syne": "^0.2.3",
+    "@expo/metro-runtime": "~4.0.1",
     "@noble/hashes": "^1.7.1",
     "@react-native-async-storage/async-storage": "1.23.1",
     "aes-js": "^3.1.2",
@@ -32,7 +33,9 @@
     "expo-status-bar": "~2.0.0",
     "gun": "^0.2020.1241",
     "react": "18.3.1",
-    "react-native": "0.76.5"
+    "react-dom": "18.3.1",
+    "react-native": "0.76.5",
+    "react-native-web": "~0.19.13"
   },
   "devDependencies": {
     "@babel/core": "^7.20.0"

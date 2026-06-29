@@ -72,10 +72,13 @@ function hexToBytes(hex) {
   return out;
 }
 
-// Shared key = sha256(myPrivHex + theirPubHex)
-// Both sides derive the same 32-byte key independently
-function deriveSharedKey(myPrivHex, theirPubHex) {
-  const input = aesjs.utils.utf8.toBytes(myPrivHex + theirPubHex);
+// Shared key = sha256(sortedPubA + sortedPubB)
+// Sorted so BOTH sides always derive the EXACT same key regardless of who calls it
+// Phone A: sha256(A_pub + B_pub)  — after sorting
+// Phone B: sha256(A_pub + B_pub)  — same result ✅
+function deriveSharedKey(myPubHex, theirPubHex) {
+  const sorted = [myPubHex, theirPubHex].sort().join('');
+  const input  = aesjs.utils.utf8.toBytes(sorted);
   return sha256(input);
 }
 
@@ -379,7 +382,7 @@ function ChatScreen({ identity, contact, onBack }) {
 
   // Derive shared key once
   useEffect(() => {
-    sharedKey.current = deriveSharedKey(identity.privHex, contact.pubHex);
+    sharedKey.current = deriveSharedKey(identity.pubHex, contact.pubHex);
   }, [identity.privHex, contact.pubHex]);
 
   // Load cached messages from AsyncStorage

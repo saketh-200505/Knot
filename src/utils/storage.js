@@ -1,19 +1,39 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 const KEYS = {
-  ONBOARDED:       'av_onboarded',
-  VAULT_PW_HASH:   'av_vault_pw_hash',
-  RECOVERY_HASH:   'av_recovery_hash',
-  GESTURE:         'av_gesture',
-  SESSION_DURATION:'av_session_duration',
-  PHOTO_INDEX:     'av_photo_index',
-  GROUPS:          'av_groups',
-  AUDIT_LOG:       'av_audit_log',
-  IMPORTED_INDEX:  'av_imported_index',
-  BACKUP_DIR_URI:  'av_backup_dir_uri',
+  ONBOARDED:         'av_onboarded',
+  VAULT_PW_HASH:     'av_vault_pw_hash',
+  RECOVERY_HASH:     'av_recovery_hash',
+  GESTURE:           'av_gesture',
+  SESSION_DURATION:  'av_session_duration',
+  PHOTO_INDEX:       'av_photo_index',
+  GROUPS:            'av_groups',
+  AUDIT_LOG:         'av_audit_log',
+  IMPORTED_INDEX:    'av_imported_index',
+  BACKUP_DIR_URI:    'av_backup_dir_uri',
+  SHARED_SUBDIR_URI: 'av_shared_subdir_uri',
 };
 
 export { KEYS };
+
+// Human-readable on-disk filename: sortable by date, filter-able by "Knot"
+// or by group name in any file manager, and self-identifying when shared
+// out to another app. The internal id (metadata key) is unchanged; only the
+// filename on disk changes.
+export function prettyFilename({ kind = 'vault', groupLabel = '', ext = 'dat' } = {}) {
+  const p2 = n => String(n).padStart(2, '0');
+  const d  = new Date();
+  const ts =
+    d.getFullYear() + p2(d.getMonth()+1) + p2(d.getDate()) + '_' +
+    p2(d.getHours()) + p2(d.getMinutes()) + p2(d.getSeconds());
+  const slug = String(groupLabel || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 20);
+  const rand = Math.random().toString(16).slice(2, 6).padStart(4, '0');
+  const parts = ['Knot'];
+  if (kind === 'shared') parts.push('shared');
+  if (slug) parts.push(slug);
+  parts.push(ts, rand);
+  return parts.join('_') + '.' + ext;
+}
 
 export const storage = {
   async get(key) {
@@ -164,8 +184,25 @@ export async function getBackupDirUri() {
   return storage.get(KEYS.BACKUP_DIR_URI);
 }
 export async function setBackupDirUri(uri) {
+  // Any cached shared/ subfolder URI belongs to the *previous* backup root,
+  // so invalidate it whenever the root changes.
+  await storage.remove(KEYS.SHARED_SUBDIR_URI);
   return storage.set(KEYS.BACKUP_DIR_URI, uri);
 }
 export async function clearBackupDirUri() {
+  await storage.remove(KEYS.SHARED_SUBDIR_URI);
   return storage.remove(KEYS.BACKUP_DIR_URI);
+}
+
+// URI of the "shared/" subfolder created inside the user's backup dir the
+// first time a shared/imported file is written there. Cached so we don't
+// re-create (or duplicate) the folder on every import.
+export async function getSharedSubdirUri() {
+  return storage.get(KEYS.SHARED_SUBDIR_URI);
+}
+export async function setSharedSubdirUri(uri) {
+  return storage.set(KEYS.SHARED_SUBDIR_URI, uri);
+}
+export async function clearSharedSubdirUri() {
+  return storage.remove(KEYS.SHARED_SUBDIR_URI);
 }

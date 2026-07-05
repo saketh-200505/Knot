@@ -26,6 +26,7 @@ import {
   getGroups, addGroup, findGroupsByFingerprint, removeGroup,
   getAuditLog, clearAuditLog, logEvent,
   getBackupDirUri, setBackupDirUri,
+  prettyFilename,
 } from '../utils/storage';
 import { useSession }  from '../hooks/useSession';
 import { SessionBar }  from '../components/SessionBar';
@@ -260,18 +261,18 @@ export function Vault({ onLogout }) {
     toast_(`Backup folder unavailable (${reason}). Falling back to internal storage — re-pick it in Settings if you still want an external copy.`, 'error');
   };
 
-  const writeToInternal = async (group, id, b64) => {
+  const writeToInternal = async (group, filename, b64) => {
     const dir  = group ? `${VAULT_DIR}${group.id}/` : VAULT_DIR;
     await ensureDir(dir);
-    const path = `${dir}${id}.dat`;
+    const path = `${dir}${filename}`;
     await FileSystem.writeAsStringAsync(path, b64, {encoding:FileSystem.EncodingType.Base64});
     return path;
   };
 
   const writeVaultFile = async (group, id, sealedBytes) => {
     const b64 = uint8ToBase64(sealedBytes);
+    const filename = prettyFilename({ kind: 'vault', groupLabel: group?.label });
     if (backupDirUri) {
-      const filename = group ? `${group.id}_${id}.dat` : `${id}.dat`;
       try {
         const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, filename, 'application/octet-stream');
         await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
@@ -282,12 +283,12 @@ export function Vault({ onLogout }) {
         // rejected createSAFFileAsync — either way the URI is dead.
         if (/isn't writable|not writable|permission|rejected|createSAFFile/i.test(msg)) {
           await invalidateBackupDir('permission lost');
-          return writeToInternal(group, id, b64);
+          return writeToInternal(group, filename, b64);
         }
         throw e; // unknown reason — surface it via the existing toast path
       }
     }
-    return writeToInternal(group, id, b64);
+    return writeToInternal(group, filename, b64);
   };
 
   // Some picker URIs can't be read directly by expo-file-system:

@@ -13,6 +13,8 @@ import {
 } from '../utils/crypto';
 import {
   getImportedIndex, addImportedToIndex, removeImportedFromIndex, logEvent,
+  getBackupDirUri, getSharedSubdirUri, setSharedSubdirUri, clearSharedSubdirUri,
+  prettyFilename,
 } from '../utils/storage';
 import { PassSheet } from './PassSheet';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
@@ -129,16 +131,54 @@ export function SharedTab({ onSaveToVault, showToast }) {
   useEffect(() => { load(); }, []);
   const load = async () => setItems(await getImportedIndex());
 
+  // Return the URI of "<backupRoot>/shared/", creating it the first time
+  // it's needed. Cached in AsyncStorage so repeat imports don't spawn
+  // "shared (1)", "shared (2)" duplicates. A stale cache (folder deleted
+  // by the user, permission revoked) is caught by the write path below and
+  // cleared, so the next import re-creates it.
+  const ensureSharedSubdir = async (backupDirUri) => {
+    const cached = await getSharedSubdirUri();
+    if (cached) return cached;
+    const created = await FileSystem.StorageAccessFramework.makeDirectoryAsync(backupDirUri, 'shared');
+    await setSharedSubdirUri(created);
+    return created;
+  };
+
+  // Puts the imported file wherever the user's storage settings say it
+  // should go: <backupRoot>/shared/ if a base folder was picked, else the
+  // internal app sandbox. Falls back to the sandbox on any SAF failure so
+  // an import never gets lost.
+  const writeSharedFile = async (sourceUri, filename) => {
+    const backupDirUri = await getBackupDirUri();
+    if (backupDirUri) {
+      try {
+        const sharedDirUri = await ensureSharedSubdir(backupDirUri);
+        const b64 = await FileSystem.readAsStringAsync(sourceUri, { encoding: FileSystem.EncodingType.Base64 });
+        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(sharedDirUri, filename, 'application/octet-stream');
+        await FileSystem.writeAsStringAsync(fileUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+        return fileUri;
+      } catch (e) {
+        // Grant dead or subfolder missing — drop the cache so the next
+        // import rebuilds it, and land this one in the sandbox instead.
+        await clearSharedSubdirUri();
+        console.warn('[knot-shared] SAF write failed, using internal:', e?.message || e);
+      }
+    }
+    await ensureSharedDir();
+    const destPath = SHARED_DIR + filename;
+    await FileSystem.copyAsync({ from: sourceUri, to: destPath });
+    return destPath;
+  };
+
   const importFile = async () => {
     try {
       const res = await DocumentPicker.getDocumentAsync({ type: '*/*', copyToCacheDirectory: true });
       if (res.canceled || !res.assets?.length) return;
-      await ensureSharedDir();
       const asset = res.assets[0];
       const id = genId();
-      const destPath = SHARED_DIR + id + '.dat';
-      await FileSystem.copyAsync({ from: asset.uri, to: destPath });
-      const entry = { id, filePath: destPath, name: asset.name || 'shared_photo.dat', addedAt: Date.now() };
+      const filename = prettyFilename({ kind: 'shared' });
+      const destPath = await writeSharedFile(asset.uri, filename);
+      const entry = { id, filePath: destPath, name: asset.name || filename, addedAt: Date.now() };
       await addImportedToIndex(entry);
       await logEvent('shared_import', entry.name);
       await load();

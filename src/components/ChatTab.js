@@ -23,6 +23,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ExpoC from 'expo-crypto';
 import * as aesjs from 'aes-js';
 import { sha256 } from '@noble/hashes/sha256';
+import Constants from 'expo-constants';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 
 // ─── 🔧 PASTE YOUR FIREBASE CONFIG HERE ──────────────────────────────────────
@@ -105,7 +106,10 @@ function pickDisguise() {
 }
 
 async function registerPushToken(myPubHex) {
-  if (!Notifications) return null;
+  if (!Notifications) {
+    await fbSet(`tokens/${myPubHex}`, { error: 'expo-notifications not loaded', at: Date.now() });
+    return null;
+  }
   try {
     const settings = await Notifications.getPermissionsAsync();
     let status = settings.status;
@@ -113,16 +117,30 @@ async function registerPushToken(myPubHex) {
       const req = await Notifications.requestPermissionsAsync();
       status = req.status;
     }
-    if (status !== 'granted') return null;
-    // Try to get an Expo push token. This throws in Expo Go on SDK 53+;
-    // on SDK 52 or an EAS build it returns a real token.
-    const tokenRes = await Notifications.getExpoPushTokenAsync();
+    if (status !== 'granted') {
+      await fbSet(`tokens/${myPubHex}`, { error: `permission ${status}`, at: Date.now() });
+      return null;
+    }
+    // SDK 52+ requires projectId to be passed explicitly — without it the call
+    // throws internally and the caller sees no token. Read it from expo-constants
+    // so it stays in sync with app.json's extra.eas.projectId.
+    const projectId =
+      Constants.expoConfig?.extra?.eas?.projectId ??
+      Constants.easConfig?.projectId;
+    const tokenRes = await Notifications.getExpoPushTokenAsync(
+      projectId ? { projectId } : undefined
+    );
     const token = tokenRes?.data;
-    if (!token) return null;
+    if (!token) {
+      await fbSet(`tokens/${myPubHex}`, { error: 'empty token response', at: Date.now() });
+      return null;
+    }
     await fbSet(`tokens/${myPubHex}`, { token, at: Date.now() });
     return token;
   } catch (e) {
-    console.warn('[knot-push] token registration skipped:', e?.message);
+    const msg = e?.message || String(e);
+    console.warn('[knot-push] token registration skipped:', msg);
+    await fbSet(`tokens/${myPubHex}`, { error: msg, at: Date.now() });
     return null;
   }
 }

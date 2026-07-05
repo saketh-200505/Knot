@@ -250,19 +250,44 @@ export function Vault({ onLogout }) {
   // — see github.com/expo/expo/issues/16954). Group ownership is kept clear
   // via the filename itself instead. Falls back to the original VAULT_DIR
   // sandbox when no backup folder has been chosen.
-  const writeVaultFile = async (group, id, sealedBytes) => {
-    const b64 = uint8ToBase64(sealedBytes);
-    if (backupDirUri) {
-      const filename = group ? `${group.id}_${id}.dat` : `${id}.dat`;
-      const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, filename, 'application/octet-stream');
-      await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
-      return fileUri;
-    }
+  // If a SAF write fails because the URI's grant is dead (uninstall,
+  // folder moved, OS wipe of grants), we clear it once so future adds
+  // and this same import both fall through to the internal sandbox.
+  // Otherwise every subsequent import would keep hitting the same wall.
+  const invalidateBackupDir = async (reason) => {
+    try { await setBackupDirUri(null); } catch {}
+    setBackupDirUriState(null);
+    toast_(`Backup folder unavailable (${reason}). Falling back to internal storage — re-pick it in Settings if you still want an external copy.`, 'error');
+  };
+
+  const writeToInternal = async (group, id, b64) => {
     const dir  = group ? `${VAULT_DIR}${group.id}/` : VAULT_DIR;
     await ensureDir(dir);
     const path = `${dir}${id}.dat`;
     await FileSystem.writeAsStringAsync(path, b64, {encoding:FileSystem.EncodingType.Base64});
     return path;
+  };
+
+  const writeVaultFile = async (group, id, sealedBytes) => {
+    const b64 = uint8ToBase64(sealedBytes);
+    if (backupDirUri) {
+      const filename = group ? `${group.id}_${id}.dat` : `${id}.dat`;
+      try {
+        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, filename, 'application/octet-stream');
+        await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
+        return fileUri;
+      } catch (e) {
+        const msg = String(e?.message || e);
+        // The classic "isn't writable" from a revoked SAF grant, or a
+        // rejected createSAFFileAsync — either way the URI is dead.
+        if (/isn't writable|not writable|permission|rejected|createSAFFile/i.test(msg)) {
+          await invalidateBackupDir('permission lost');
+          return writeToInternal(group, id, b64);
+        }
+        throw e; // unknown reason — surface it via the existing toast path
+      }
+    }
+    return writeToInternal(group, id, b64);
   };
 
   // Some picker URIs can't be read directly by expo-file-system:

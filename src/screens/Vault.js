@@ -265,8 +265,33 @@ export function Vault({ onLogout }) {
     return path;
   };
 
+  // Some picker URIs can't be read directly by expo-file-system:
+  //   - Android content:// (SAF) — often works but not on every OEM
+  //   - iOS ph:// (PhotoKit)     — never works with readAsStringAsync
+  // Copying to cacheDirectory first gives us a plain file:// URI that
+  // readAsStringAsync always accepts, and lets us also surface a real
+  // error when the picker's URI itself is broken.
+  const readAssetBase64 = async (asset) => {
+    const uri = asset.uri || '';
+    const scheme = uri.slice(0, uri.indexOf(':') + 1).toLowerCase();
+    if (scheme === 'file:') {
+      return FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+    }
+    const ext = (asset.fileName || uri.split('/').pop() || 'blob').split('.').pop().split('?')[0];
+    const tmp = `${FileSystem.cacheDirectory}knot_import_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+    await FileSystem.copyAsync({ from: uri, to: tmp });
+    try {
+      return await FileSystem.readAsStringAsync(tmp, { encoding: FileSystem.EncodingType.Base64 });
+    } finally {
+      FileSystem.deleteAsync(tmp, { idempotent: true }).catch(() => {});
+    }
+  };
+
   const encryptOne = async (asset, key, salt, group, passphrase) => {
-    const b64 = await FileSystem.readAsStringAsync(asset.uri, {encoding:FileSystem.EncodingType.Base64});
+    const b64 = await readAssetBase64(asset);
+    if (!b64 || b64.length === 0) {
+      throw new Error(`Empty file (${asset.fileName || asset.uri || 'unknown'})`);
+    }
     const bytes  = base64ToUint8(b64);
     const sealed = group ? await sealWithKey(bytes, key, salt) : await seal(bytes, passphrase);
     const id     = genId();
@@ -299,6 +324,7 @@ export function Vault({ onLogout }) {
     const salt = group ? base64ToUint8(group.salt) : null;
     const key  = group ? deriveKey(passphrase, salt, DEFAULT_KDF_ITERATIONS) : null;
     let count  = 0;
+    let firstErr = null;
     for (const asset of files) {
       await new Promise(r => setTimeout(r, 0));
       try {
@@ -306,16 +332,19 @@ export function Vault({ onLogout }) {
         const entry = await encryptOne(asset, key, salt, group, passphrase);
         await addPhotoToIndex(entry);
         count++;
-      } catch(e) { console.warn('Import err', e); }
+      } catch(e) {
+        console.warn('[KNOT] Import err:', e?.message, e?.stack);
+        if (!firstErr) firstErr = e?.message || String(e);
+      }
     }
     await loadPhotos();
     await logEvent('import', `${count}/${files.length} -> ${group?.label||'?'}`);
     setPending([]); pendingRef.current = []; setProc('');
-    toast_(count>0
-      ? `${count} item${count!==1?'s':''} added to "${group?.label}"`
-      : 'Encryption failed — try again',
-      count>0 ? 'success' : 'error'
-    );
+    if (count > 0) {
+      toast_(`${count} item${count!==1?'s':''} added to "${group?.label}"`, 'success');
+    } else {
+      toast_(`Encryption failed — ${firstErr || 'unknown error'}`, 'error');
+    }
   };
 
   const onPickGroup  = g  => { setShowGroupPick(false); setTimeout(() => setShowExistingPass(g), 350); };

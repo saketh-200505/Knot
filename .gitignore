@@ -29,6 +29,13 @@ yarn-error.*
 .env*.local
 .env
 
+# Firebase / FCM credentials — NEVER commit
+# service-account.json = server-side push creds (uploaded to Expo dashboard only)
+# google-services.json = client Firebase config (keep out of public repos)
+google-services.json
+service-account*.json
+*-firebase-adminsdk-*.json
+
 # typescript
 *.tsbuildinfo
 

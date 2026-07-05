@@ -35,22 +35,6 @@ jobs:
       - name: Install Expo CLI
         run: npm install -g expo-cli
 
-      # Decodes the base64 GH secret into ./google-services.json before
-      # prebuild reads android.googleServicesFile from app.json. The file
-      # is gitignored, so this is the only place it appears in a build.
-      - name: Restore google-services.json from secret
-        env:
-          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
-        run: |
-          if [ -z "$GOOGLE_SERVICES_JSON_BASE64" ]; then
-            echo "::error::GOOGLE_SERVICES_JSON_BASE64 secret is missing. Push notifications won't work."
-            exit 1
-          fi
-          echo "$GOOGLE_SERVICES_JSON_BASE64" | base64 -d > google-services.json
-          # sanity check — the file must at least parse as JSON
-          node -e "JSON.parse(require('fs').readFileSync('google-services.json','utf8'))"
-          echo "google-services.json restored ($(wc -c < google-services.json) bytes)"
-
       - name: Generate Android Project
         run: npx expo prebuild --platform android --non-interactive
 

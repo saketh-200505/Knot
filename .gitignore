@@ -29,10 +29,16 @@ yarn-error.*
 .env*.local
 .env
 
-# Firebase / FCM credentials — NEVER commit
-# service-account.json = server-side push creds (uploaded to Expo dashboard only)
-# google-services.json = client Firebase config (keep out of public repos)
-google-services.json
+# Firebase / FCM credentials
+# google-services.json is client-side config (Firebase project id, API
+# key, app id). It's baked into every APK anyway, so committing it is a
+# common trade-off for personal projects; if you fork this repo, get
+# your own from Firebase Console. Keeping it tracked lets CI build
+# without base64 secret gymnastics.
+#
+# service-account.json is the ADMIN key — lets anyone send FCM messages
+# and read/write your Firebase DB as project owner. NEVER commit it.
+# It goes to the Expo dashboard via `eas credentials` and nowhere else.
 service-account*.json
 *-firebase-adminsdk-*.json
 

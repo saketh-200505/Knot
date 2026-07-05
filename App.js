@@ -9,7 +9,7 @@ import { SnakeGame } from './src/screens/SnakeGame';
 import { VaultLogin } from './src/screens/VaultLogin';
 import { Vault } from './src/screens/Vault';
 import { SSBlock } from './src/components/SSBlock';
-import { COLORS } from './src/utils/theme';
+import { COLORS, COLOR_SCHEME } from './src/utils/theme';
 
 const ROUTES = { LOADING:'loading', ONBOARDING:'onboarding', GAME:'game', LOGIN:'login', VAULT:'vault' };
 
@@ -31,12 +31,12 @@ export default function App() {
   }, [fontsLoaded, fontError]);
 
   if (!fontsLoaded && !fontError) {
-    return <View style={s.splash}><StatusBar barStyle="light-content" backgroundColor={COLORS.bg} /></View>;
+    return <View style={s.splash}><StatusBar barStyle={COLOR_SCHEME === 'dark' ? 'light-content' : 'dark-content'} backgroundColor={COLORS.bg} /></View>;
   }
 
   return (
     <View style={s.root}>
-      <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+      <StatusBar barStyle={COLOR_SCHEME === 'dark' ? 'light-content' : 'dark-content'} backgroundColor={COLORS.bg} />
       {route === ROUTES.LOADING    && <View style={s.splash} />}
       {route === ROUTES.ONBOARDING && <Onboarding onDone={() => setRoute(ROUTES.GAME)} />}
       {route === ROUTES.GAME       && <SnakeGame onSecretGesture={() => setRoute(ROUTES.LOGIN)} />}

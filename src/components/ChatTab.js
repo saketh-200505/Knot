@@ -797,7 +797,7 @@ function ChatScreen({ identity, contact, onBack }) {
               {item.fromMe && item.status === 'failed'  && '⚠︎ not delivered  '}
               {timeStr(item.ts)}
               {item.fromMe && item.status !== 'sending' && item.status !== 'failed' && (
-                <Text style={{ color: item.status === 'read' ? '#2ea2ff' : COLORS.textMuted }}>
+                <Text style={{ color: item.status === 'read' ? COLORS.indigo : COLORS.textMuted }}>
                   {'  '}{item.status === 'read' ? '✓✓' : '✓'}
                 </Text>
               )}
@@ -872,16 +872,16 @@ const s = StyleSheet.create({
   btnGTxt:   { fontFamily: FONTS.bodyMed, fontSize: 15, color: COLORS.textSecondary },
   btnOff:    { opacity: 0.45 },
 
-  header:    { flexDirection: 'row', alignItems: 'center', paddingTop: 52, paddingBottom: SPACING.md, paddingHorizontal: SPACING.md, backgroundColor: COLORS.surface1, borderBottomWidth: 1, borderColor: COLORS.border, gap: SPACING.sm },
-  headerTitle:{ fontFamily: FONTS.headingX, fontSize: 20, color: COLORS.textPrimary },
-  statusTxt: { fontFamily: FONTS.body, fontSize: 11, color: COLORS.textMuted, marginTop: 1 },
+  header:    { flexDirection: 'row', alignItems: 'center', paddingTop: 52, paddingBottom: SPACING.sm, paddingHorizontal: SPACING.md, backgroundColor: COLORS.surface1, borderBottomWidth: 0.5, borderColor: COLORS.border, gap: SPACING.sm },
+  headerTitle:{ fontFamily: FONTS.bodyMed, fontSize: 17, color: COLORS.textPrimary, letterSpacing: -0.2 },
+  statusTxt: { fontFamily: FONTS.body, fontSize: 12, color: COLORS.textMuted, marginTop: 1 },
   backBtn:   { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.surface2, alignItems: 'center', justifyContent: 'center' },
   chip:      { backgroundColor: COLORS.indigoDim, paddingHorizontal: SPACING.md, paddingVertical: 6, borderRadius: RADIUS.full },
   chipTxt:   { fontFamily: FONTS.bodyMed, fontSize: 13, color: COLORS.indigo },
 
   av:        { width: 44, height: 44, borderRadius: 22, backgroundColor: COLORS.indigoDim, alignItems: 'center', justifyContent: 'center' },
   avTxt:     { fontFamily: FONTS.heading, fontSize: 15, color: COLORS.indigo },
-  onlineDot: { position: 'absolute', bottom: 0, right: 0, width: 12, height: 12, borderRadius: 6, backgroundColor: '#22c55e', borderWidth: 2, borderColor: COLORS.surface1 },
+  onlineDot: { position: 'absolute', bottom: 0, right: 0, width: 12, height: 12, borderRadius: 6, backgroundColor: COLORS.emerald, borderWidth: 2, borderColor: COLORS.surface1 },
   bellBtn:   { width: 36, height: 36, borderRadius: 18, alignItems: 'center', justifyContent: 'center' },
 
   keyCard:   { margin: SPACING.md, backgroundColor: COLORS.surface1, borderRadius: RADIUS.lg, padding: SPACING.md, borderWidth: 1, borderColor: COLORS.border },
@@ -904,14 +904,15 @@ const s = StyleSheet.create({
   fab:       { position: 'absolute', bottom: SPACING.xl, right: SPACING.lg, width: 56, height: 56, borderRadius: 28, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center', shadowColor: COLORS.indigo, shadowOpacity: 0.4, shadowOffset: { width: 0, height: 4 }, shadowRadius: 10, elevation: 8 },
   fabTxt:    { fontSize: 28, color: '#fff', lineHeight: 32, marginTop: -2 },
 
-  msgList:   { padding: SPACING.md, paddingBottom: SPACING.lg },
-  bWrap:     { marginBottom: SPACING.sm },
+  msgList:   { paddingHorizontal: SPACING.md, paddingBottom: SPACING.lg, paddingTop: SPACING.sm },
+  bWrap:     { marginBottom: 3 },
   bWrapMe:   { alignItems: 'flex-end' },
   bWrapThem: { alignItems: 'flex-start' },
-  bubble:    { maxWidth: '78%', borderRadius: RADIUS.lg, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm + 2 },
-  bMe:       { backgroundColor: COLORS.indigo, borderBottomRightRadius: 4 },
-  bThem:     { backgroundColor: COLORS.surface1, borderBottomLeftRadius: 4, borderWidth: 1, borderColor: COLORS.border },
-  bFailed:   { opacity: 0.55, borderWidth: 1, borderColor: '#f43f5e' },
+  // iOS Messages bubbles: 18px radius, tight vertical padding, no border on outgoing
+  bubble:    { maxWidth: '76%', borderRadius: 18, paddingHorizontal: 14, paddingVertical: 8 },
+  bMe:       { backgroundColor: COLORS.indigo, borderBottomRightRadius: 5 },
+  bThem:     { backgroundColor: COLORS.surface3, borderBottomLeftRadius: 5 },
+  bFailed:   { opacity: 0.55, borderWidth: 1, borderColor: COLORS.rose },
 
   replyQuote:     { borderLeftWidth: 3, paddingLeft: SPACING.sm, paddingRight: SPACING.sm, paddingVertical: 4, borderRadius: 4, marginBottom: 6 },
   replyQuoteMe:   { borderLeftColor: 'rgba(255,255,255,0.7)', backgroundColor: 'rgba(255,255,255,0.14)' },
@@ -922,12 +923,13 @@ const s = StyleSheet.create({
   replyBar:     { flexDirection: 'row', alignItems: 'center', gap: SPACING.sm, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm, backgroundColor: COLORS.surface2, borderTopWidth: 1, borderColor: COLORS.border },
   replyBarName: { fontFamily: FONTS.bodyMed, fontSize: 11, color: COLORS.indigo, marginBottom: 1 },
   replyBarText: { fontFamily: FONTS.body, fontSize: 12, color: COLORS.textSecondary },
-  bTxt:      { fontFamily: FONTS.body, fontSize: 15, lineHeight: 22 },
+  bTxt:      { fontFamily: FONTS.body, fontSize: 17, lineHeight: 22 }, // iOS body: 17pt
   time:      { fontFamily: FONTS.body, fontSize: 10, color: COLORS.textMuted, marginTop: 3, paddingHorizontal: 4 },
 
-  inputBar:  { flexDirection: 'row', alignItems: 'flex-end', padding: SPACING.sm, paddingBottom: Platform.OS === 'ios' ? SPACING.lg : SPACING.sm, backgroundColor: COLORS.surface1, borderTopWidth: 1, borderColor: COLORS.border, gap: SPACING.sm },
-  msgInp:    { flex: 1, backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border, borderRadius: RADIUS.xl, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm, fontFamily: FONTS.body, fontSize: 15, color: COLORS.textPrimary, maxHeight: 120 },
-  sendBtn:   { width: 42, height: 42, borderRadius: 21, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center' },
-  sendBtnOff:{ backgroundColor: COLORS.border },
+  // iOS Messages input: pill-shaped, no border on light, subtle background
+  inputBar:  { flexDirection: 'row', alignItems: 'flex-end', padding: SPACING.sm, paddingBottom: Platform.OS === 'ios' ? SPACING.lg : SPACING.sm, backgroundColor: COLORS.surface1, borderTopWidth: 0.5, borderColor: COLORS.border, gap: SPACING.sm },
+  msgInp:    { flex: 1, backgroundColor: COLORS.surface2, borderWidth: 0.5, borderColor: COLORS.border, borderRadius: 20, paddingHorizontal: 14, paddingVertical: 8, fontFamily: FONTS.body, fontSize: 17, color: COLORS.textPrimary, maxHeight: 120, minHeight: 36 },
+  sendBtn:   { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center' },
+  sendBtnOff:{ backgroundColor: COLORS.surface3 },
   sendIcon:  { fontSize: 18, color: '#fff', marginTop: -1 },
 });

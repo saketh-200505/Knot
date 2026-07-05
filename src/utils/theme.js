@@ -1,62 +1,127 @@
-// Knot — Colorful light theme
-export const COLORS = {
-  // Backgrounds
-  bg:        '#F0F4FF',
+// Knot — iOS Messages-inspired palette, follows system color scheme.
+//
+// COLORS is resolved once at module load using Appearance.getColorScheme(),
+// so every existing `import { COLORS } from '../utils/theme'` re-skins
+// itself without touching a single call-site or StyleSheet.create.
+// The trade-off: switching system dark/light while the app is running
+// requires a reopen for the new palette to take effect. Everything else
+// (screens, sheets, chat bubbles) picks up the new values automatically.
+
+import { Appearance } from 'react-native';
+
+// ─── Base palettes ────────────────────────────────────────────────────────────
+// Values are taken from Apple's iOS system colors (system gray, iOS blue,
+// system separator, etc.) so the app feels native on both platforms.
+const LIGHT = {
+  bg:        '#F2F2F7', // iOS system background
   surface1:  '#FFFFFF',
-  surface2:  '#F5F7FF',
-  surface3:  '#EDF0FF',
-  border:    '#DDE3F5',
+  surface2:  '#F2F2F7',
+  surface3:  '#E5E5EA', // iOS system gray 5
+  border:    '#C6C6C8', // iOS separator (opaque)
 
-  // Accent palette — vibrant but harmonious
-  indigo:    '#5B5BD6',
-  indigoDim: '#E8E8FF',
-  purple:    '#8B5CF6',
-  purpleDim: '#EDE9FE',
-  teal:      '#0D9488',
-  tealDim:   '#CCFBF1',
-  rose:      '#F43F5E',
-  roseDim:   '#FFE4E8',
-  amber:     '#F59E0B',
-  amberDim:  '#FEF3C7',
-  sky:       '#0EA5E9',
-  skyDim:    '#E0F2FE',
-  emerald:   '#10B981',
-  emeraldDim:'#D1FAE5',
-  orange:    '#F97316',
-  orangeDim: '#FFEDD5',
-  pink:      '#EC4899',
-  pinkDim:   '#FCE7F3',
-  lime:      '#84CC16',
-  limeDim:   '#F7FEE7',
+  // Accent — iOS system blue
+  indigo:    '#007AFF',
+  indigoDim: 'rgba(0,122,255,0.12)',
+  purple:    '#AF52DE',
+  purpleDim: 'rgba(175,82,222,0.12)',
+  teal:      '#30B0C7',
+  tealDim:   'rgba(48,176,199,0.12)',
+  rose:      '#FF375F',
+  roseDim:   'rgba(255,55,95,0.12)',
+  amber:     '#FF9500',
+  amberDim:  'rgba(255,149,0,0.12)',
+  sky:       '#5AC8FA',
+  skyDim:    'rgba(90,200,250,0.12)',
+  emerald:   '#34C759',
+  emeraldDim:'rgba(52,199,89,0.12)',
+  orange:    '#FF9500',
+  orangeDim: 'rgba(255,149,0,0.12)',
+  pink:      '#FF2D55',
+  pinkDim:   'rgba(255,45,85,0.12)',
+  lime:      '#32D74B',
+  limeDim:   'rgba(50,215,75,0.12)',
 
-  // Text
-  textPrimary:   '#1E1B4B',
-  textSecondary: '#4B5563',
-  textMuted:     '#9CA3AF',
+  textPrimary:   '#000000',
+  textSecondary: 'rgba(60,60,67,0.85)', // iOS secondaryLabel
+  textMuted:     'rgba(60,60,67,0.50)', // iOS tertiaryLabel
 
-  // Game (keep dark for game screen)
-  snakeHead:  '#10b981',
-  snakeBody:  '#059669',
-  snakeEye:   '#f0f4ff',
-  food:       '#f59e0b',
-  gridLine:   '#0d1320',
+  // Game palette — stays richer for readability on the game canvas
+  snakeHead:  '#34C759',
+  snakeBody:  '#248A3D',
+  snakeEye:   '#FFFFFF',
+  food:       '#FF9500',
+  gridLine:   'rgba(0,0,0,0.06)',
 
-  // Aliases for backward compat
-  green:   '#10B981',
-  blue:    '#0EA5E9',
-  violet:  '#8B5CF6',
+  green:  '#34C759',
+  blue:   '#007AFF',
+  violet: '#AF52DE',
 };
 
-// Group folder colours — each gets a unique vibrant combo
+const DARK = {
+  bg:        '#000000', // True black — best on OLED, matches iOS Messages dark
+  surface1:  '#1C1C1E', // iOS systemGray6 (dark)
+  surface2:  '#2C2C2E', // iOS systemGray5 (dark)
+  surface3:  '#3A3A3C',
+  border:    '#38383A', // iOS separator (dark)
+
+  indigo:    '#0A84FF', // iOS system blue (dark)
+  indigoDim: 'rgba(10,132,255,0.20)',
+  purple:    '#BF5AF2',
+  purpleDim: 'rgba(191,90,242,0.20)',
+  teal:      '#40C8E0',
+  tealDim:   'rgba(64,200,224,0.20)',
+  rose:      '#FF375F',
+  roseDim:   'rgba(255,55,95,0.20)',
+  amber:     '#FF9F0A',
+  amberDim:  'rgba(255,159,10,0.20)',
+  sky:       '#64D2FF',
+  skyDim:    'rgba(100,210,255,0.20)',
+  emerald:   '#30D158',
+  emeraldDim:'rgba(48,209,88,0.20)',
+  orange:    '#FF9F0A',
+  orangeDim: 'rgba(255,159,10,0.20)',
+  pink:      '#FF375F',
+  pinkDim:   'rgba(255,55,95,0.20)',
+  lime:      '#30D158',
+  limeDim:   'rgba(48,209,88,0.20)',
+
+  textPrimary:   '#FFFFFF',
+  textSecondary: 'rgba(235,235,245,0.85)',
+  textMuted:     'rgba(235,235,245,0.55)',
+
+  snakeHead:  '#30D158',
+  snakeBody:  '#248A3D',
+  snakeEye:   '#F0F4FF',
+  food:       '#FF9F0A',
+  gridLine:   'rgba(255,255,255,0.06)',
+
+  green:  '#30D158',
+  blue:   '#0A84FF',
+  violet: '#BF5AF2',
+};
+
+// Resolve at import time — the app re-picks on next launch if the user
+// changes their system theme.
+const scheme = Appearance.getColorScheme();
+export const COLORS = scheme === 'dark' ? DARK : LIGHT;
+export const COLOR_SCHEME = scheme === 'dark' ? 'dark' : 'light';
+// Also expose the raw palettes so components can build a palette-aware
+// alternate (e.g. status bar style) without another Appearance call.
+export const LIGHT_COLORS = LIGHT;
+export const DARK_COLORS = DARK;
+
+// Group folder colours — semantic accents used to differentiate photo groups.
+// Kept the same across themes; the dot/text values are vivid enough to work
+// on both surface1 backgrounds.
 export const GROUP_PALETTES = [
-  { bg: '#EDE9FE', dot: '#8B5CF6', text: '#5B21B6', icon: '#7C3AED' }, // purple
-  { bg: '#CCFBF1', dot: '#0D9488', text: '#0F766E', icon: '#14B8A6' }, // teal
-  { bg: '#FFE4E8', dot: '#F43F5E', text: '#BE123C', icon: '#E11D48' }, // rose
-  { bg: '#E0F2FE', dot: '#0EA5E9', text: '#0369A1', icon: '#0284C7' }, // sky
-  { bg: '#FEF3C7', dot: '#F59E0B', text: '#B45309', icon: '#D97706' }, // amber
-  { bg: '#FCE7F3', dot: '#EC4899', text: '#9D174D', icon: '#DB2777' }, // pink
-  { bg: '#F7FEE7', dot: '#84CC16', text: '#4D7C0F', icon: '#65A30D' }, // lime
-  { bg: '#FFEDD5', dot: '#F97316', text: '#C2410C', icon: '#EA580C' }, // orange
+  { bg: 'rgba(175,82,222,0.14)', dot: '#AF52DE', text: '#AF52DE', icon: '#AF52DE' }, // purple
+  { bg: 'rgba(48,176,199,0.14)', dot: '#30B0C7', text: '#30B0C7', icon: '#30B0C7' }, // teal
+  { bg: 'rgba(255,55,95,0.14)',  dot: '#FF375F', text: '#FF375F', icon: '#FF375F' }, // rose
+  { bg: 'rgba(90,200,250,0.14)', dot: '#5AC8FA', text: '#5AC8FA', icon: '#5AC8FA' }, // sky
+  { bg: 'rgba(255,149,0,0.14)',  dot: '#FF9500', text: '#FF9500', icon: '#FF9500' }, // amber
+  { bg: 'rgba(255,45,85,0.14)',  dot: '#FF2D55', text: '#FF2D55', icon: '#FF2D55' }, // pink
+  { bg: 'rgba(50,215,75,0.14)',  dot: '#32D74B', text: '#32D74B', icon: '#32D74B' }, // lime
+  { bg: 'rgba(255,149,0,0.14)',  dot: '#FF9500', text: '#FF9500', icon: '#FF9500' }, // orange
 ];
 
 export const FONTS = {
@@ -67,15 +132,17 @@ export const FONTS = {
   mono:     'SpaceMono_400Regular',
 };
 
+// iOS-scale corner radii — chat bubbles get 18, cards 14, big sheets 24.
 export const RADIUS = {
   sm: 8,
   md: 12,
   lg: 16,
-  xl: 24,
-  xxl: 32,
+  xl: 22,
+  xxl: 28,
   full: 9999,
 };
 
+// Slightly tighter iOS spacing rhythm.
 export const SPACING = {
   xs: 4,
   sm: 8,

@@ -42,9 +42,10 @@ async function fbGet(path) {
     const res = await fetch(
       `${DB()}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`
     );
-    if (!res.ok) return null;
-    return await res.json();
-  } catch { return null; }
+    if (!res.ok) return { ok: false, data: null };
+    const data = await res.json();
+    return { ok: true, data };
+  } catch { return { ok: false, data: null }; }
 }
 
 async function fbSet(path, data) {
@@ -57,8 +58,13 @@ async function fbSet(path, data) {
         body: JSON.stringify(data),
       }
     );
-    return await res.json();
-  } catch { return null; }
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
+      return { ok: false, error: msg };
+    }
+    return { ok: true };
+  } catch (e) { return { ok: false, error: e?.message || 'Network error' }; }
 }
 
 // ─── Crypto ───────────────────────────────────────────────────────────────────
@@ -175,12 +181,22 @@ export function ChatTab() {
   }, []);
 
   const handleAdd = useCallback(async (name, pubHex) => {
-    const p = pubHex.trim();
+    const p = pubHex.replace(/\s+/g, '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(p)) {
+      Alert.alert(
+        'Invalid key',
+        'A Knot public key is 64 hex characters. Ask the other person to open Messages → "My key" and copy the whole string.'
+      );
+      return;
+    }
+    if (identity && p === identity.pubHex) {
+      Alert.alert('That\'s your own key', 'You can\'t add yourself as a contact.'); return;
+    }
     if (contacts.find(c => c.pubHex === p)) {
       Alert.alert('Already added', 'This contact is already in your list.'); return;
     }
     await saveContacts([...contacts, { id: genId(), name, pubHex: p }]);
-  }, [contacts, saveContacts]);
+  }, [contacts, saveContacts, identity]);
 
   const handleDelete = useCallback(async (id) => {
     await saveContacts(contacts.filter(c => c.id !== id));
@@ -263,11 +279,14 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
   const [busy,    setBusy]    = useState(false);
 
   const add = async () => {
-    if (!name.trim() || pub.trim().length < 10) {
-      Alert.alert('Missing info', 'Enter a name and a valid public key.'); return;
+    if (!name.trim()) {
+      Alert.alert('Missing name', 'Give this contact a name.'); return;
+    }
+    if (!pub.trim()) {
+      Alert.alert('Missing key', 'Paste the other person\'s public key.'); return;
     }
     setBusy(true);
-    await onAdd(name.trim(), pub.trim());
+    await onAdd(name.trim(), pub);
     setName(''); setPub(''); setShowAdd(false); setBusy(false);
   };
 
@@ -383,7 +402,7 @@ function ChatScreen({ identity, contact, onBack }) {
   // Derive shared key once
   useEffect(() => {
     sharedKey.current = deriveSharedKey(identity.pubHex, contact.pubHex);
-  }, [identity.privHex, contact.pubHex]);
+  }, [identity.pubHex, contact.pubHex]);
 
   // Load cached messages from AsyncStorage
   useEffect(() => {
@@ -406,8 +425,10 @@ function ChatScreen({ identity, contact, onBack }) {
   // ── POLLING — fetch Firebase every 2 seconds ──────────────────────────────
   const poll = useCallback(async () => {
     if (!sharedKey.current) return;
-    const data = await fbGet(path);
-    setOnline(true);
+    const res = await fbGet(path);
+    setOnline(res.ok);
+    if (!res.ok) return;
+    const data = res.data;
     if (!data || typeof data !== 'object') return;
 
     const newMsgs = [];
@@ -455,12 +476,12 @@ function ChatScreen({ identity, contact, onBack }) {
     };
   }, [poll]);
 
-  // Scroll to bottom when messages load
+  // Scroll to bottom whenever the message count changes (new incoming/cached)
   useEffect(() => {
     if (messages.length > 0) {
       setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 100);
     }
-  }, []);
+  }, [messages.length]);
 
   // Send message
   const send = useCallback(async () => {
@@ -472,30 +493,42 @@ function ChatScreen({ identity, contact, onBack }) {
     const id  = genId();
     const ts  = Date.now();
     const ct  = encryptMsg(text, sharedKey.current);
+    const rid = path.replace('chats/', '');
 
-    // Optimistic local add — you see it immediately
-    const msg = { id, text, ts, sender: identity.pubHex, fromMe: true };
+    const persistMessages = (list) => {
+      AsyncStorage.getItem(KEY_MSG).then(raw => {
+        const all = raw ? JSON.parse(raw) : {};
+        all[rid] = list;
+        return AsyncStorage.setItem(KEY_MSG, JSON.stringify(all));
+      }).catch(() => {});
+    };
+
+    // Optimistic local add — you see it immediately, marked as pending
+    const msg = { id, text, ts, sender: identity.pubHex, fromMe: true, status: 'sending' };
     seenIds.current.add(id);
     setMessages(prev => {
       const next = [...prev, msg].sort((a, b) => a.ts - b.ts);
-      const rid = path.replace('chats/', '');
-      AsyncStorage.getItem(KEY_MSG).then(raw => {
-        const all = raw ? JSON.parse(raw) : {};
-        all[rid] = next;
-        return AsyncStorage.setItem(KEY_MSG, JSON.stringify(all));
-      }).catch(() => {});
+      persistMessages(next);
       return next;
     });
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
 
-    // Write to Firebase
-    try {
-      await fbSet(`${path}/${id}`, { ct, ts, sender: identity.pubHex });
-    } catch {
-      Alert.alert('Send failed', 'Check your internet connection.');
-    } finally {
-      setSending(false);
+    // Write to Firebase and reconcile status
+    const res = await fbSet(`${path}/${id}`, { ct, ts, sender: identity.pubHex });
+    setMessages(prev => {
+      const next = prev.map(m =>
+        m.id === id ? { ...m, status: res.ok ? 'sent' : 'failed' } : m
+      );
+      persistMessages(next);
+      return next;
+    });
+    if (!res.ok) {
+      Alert.alert(
+        'Message not delivered',
+        `Failed to reach the server: ${res.error || 'unknown error'}. Check your internet or the Firebase configuration.`
+      );
     }
+    setSending(false);
   }, [input, sending, identity, path]);
 
   return (
@@ -537,12 +570,18 @@ function ChatScreen({ identity, contact, onBack }) {
         }
         renderItem={({ item }) => (
           <View style={[s.bWrap, item.fromMe ? s.bWrapMe : s.bWrapThem]}>
-            <View style={[s.bubble, item.fromMe ? s.bMe : s.bThem]}>
+            <View style={[
+              s.bubble,
+              item.fromMe ? s.bMe : s.bThem,
+              item.status === 'failed' && s.bFailed,
+            ]}>
               <Text style={[s.bTxt, { color: item.fromMe ? '#fff' : COLORS.textPrimary }]}>
                 {item.text}
               </Text>
             </View>
             <Text style={[s.time, { textAlign: item.fromMe ? 'right' : 'left' }]}>
+              {item.fromMe && item.status === 'sending' && '• sending  '}
+              {item.fromMe && item.status === 'failed'  && '⚠︎ not delivered  '}
               {timeStr(item.ts)}
             </Text>
           </View>
@@ -629,6 +668,7 @@ const s = StyleSheet.create({
   bubble:    { maxWidth: '78%', borderRadius: RADIUS.lg, paddingHorizontal: SPACING.md, paddingVertical: SPACING.sm + 2 },
   bMe:       { backgroundColor: COLORS.indigo, borderBottomRightRadius: 4 },
   bThem:     { backgroundColor: COLORS.surface1, borderBottomLeftRadius: 4, borderWidth: 1, borderColor: COLORS.border },
+  bFailed:   { opacity: 0.55, borderWidth: 1, borderColor: '#f43f5e' },
   bTxt:      { fontFamily: FONTS.body, fontSize: 15, lineHeight: 22 },
   time:      { fontFamily: FONTS.body, fontSize: 10, color: COLORS.textMuted, marginTop: 3, paddingHorizontal: 4 },
 

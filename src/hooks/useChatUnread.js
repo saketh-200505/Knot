@@ -20,8 +20,8 @@ const KEY_ID  = 'knot_chat_id';
 const KEY_CON = 'knot_chat_contacts';
 // Per-contact last-read timestamp, keyed by peer pubHex.
 const KEY_LAST_READ = 'knot_chat_last_read';
-const POLL_MS = 8000;
-const PRESENCE_MS = 15000;
+const POLL_MS = 4000;      // check for new incoming messages every 4s
+const PRESENCE_MS = 15000; // "I'm alive" heartbeat every 15s
 
 function roomPath(a, b) {
   return 'chats/' + [a, b].sort().join('__');

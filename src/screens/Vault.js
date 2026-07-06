@@ -114,6 +114,7 @@ export function Vault({ onLogout }) {
 
   const [tab,       setTab]       = useState(0);
   const chatUnread                = useChatUnread();
+  const [chatFull,  setChatFull]  = useState(false);
   const [photos,    setPhotos]    = useState([]);
   const [groups,    setGroups]    = useState([]);
   const [auditLog,  setAuditLog]  = useState([]);
@@ -1202,35 +1203,43 @@ export function Vault({ onLogout }) {
   // ── RENDER ────────────────────────────────────────────────────────────────
   return (
     <View style={s.root}>
-      <View style={s.tabBar}>
-        <View style={{flexDirection:'row',alignItems:'center',gap:10}}>
-          <TouchableOpacity style={s.backCircle} onPress={()=>{session.wipe();onLogout?.();}} activeOpacity={0.7}>
-            <Text style={{fontSize:18,color:COLORS.textSecondary}}>←</Text>
-          </TouchableOpacity>
-          <Text style={s.appName}>My Gallery</Text>
+      {!chatFull && (
+        <View style={s.tabBar}>
+          <View style={{flexDirection:'row',alignItems:'center',gap:10}}>
+            <TouchableOpacity style={s.backCircle} onPress={()=>{session.wipe();onLogout?.();}} activeOpacity={0.7}>
+              <Text style={{fontSize:18,color:COLORS.textSecondary}}>←</Text>
+            </TouchableOpacity>
+            <Text style={s.appName}>My Gallery</Text>
+          </View>
+          <View style={s.tabTrack}>
+            {['Gallery','Shared','Chat','Settings'].map((label,i)=>{
+              const showBadge = label==='Chat' && chatUnread.total>0;
+              return (
+                <TouchableOpacity key={label} style={[s.tabBtn,tab===i&&s.tabOn]} onPress={()=>setTab(i)} activeOpacity={0.7}>
+                  <View style={{flexDirection:'row',alignItems:'center',gap:6}}>
+                    <Text style={[s.tabTxt,tab===i&&s.tabOnTxt]}>{label}</Text>
+                    {showBadge && (
+                      <View style={s.tabBadge}>
+                        <Text style={s.tabBadgeTxt}>{chatUnread.total>99?'99+':chatUnread.total}</Text>
+                      </View>
+                    )}
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
         </View>
-        <View style={s.tabTrack}>
-          {['Gallery','Shared','Chat','Settings'].map((label,i)=>{
-            const showBadge = label==='Chat' && chatUnread.total>0;
-            return (
-              <TouchableOpacity key={label} style={[s.tabBtn,tab===i&&s.tabOn]} onPress={()=>setTab(i)} activeOpacity={0.7}>
-                <View style={{flexDirection:'row',alignItems:'center',gap:6}}>
-                  <Text style={[s.tabTxt,tab===i&&s.tabOnTxt]}>{label}</Text>
-                  {showBadge && (
-                    <View style={s.tabBadge}>
-                      <Text style={s.tabBadgeTxt}>{chatUnread.total>99?'99+':chatUnread.total}</Text>
-                    </View>
-                  )}
-                </View>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
-      </View>
+      )}
 
       {tab===0 && <GalleryTab/>}
       {tab===1 && <SharedTab showToast={toast_} onSaveToVault={(b64,mime,name,done)=>setSavePending({plainB64:b64,mime,name,onDone:done})}/>}
-      {tab===2 && <ChatTab showToast={toast_} unreadPerContact={chatUnread.perContact} />}
+      {tab===2 && (
+        <ChatTab
+          showToast={toast_}
+          unreadPerContact={chatUnread.perContact}
+          onChatVisibilityChange={setChatFull}
+        />
+      )}
       {tab===3 && <SettingsTab/>}
 
       {openGroup && <GroupView/>}

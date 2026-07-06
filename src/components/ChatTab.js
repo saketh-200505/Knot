@@ -232,11 +232,18 @@ function timeStr(ts) {
 }
 
 // ─── ROOT ─────────────────────────────────────────────────────────────────────
-export function ChatTab({ unreadPerContact = {} } = {}) {
+export function ChatTab({ unreadPerContact = {}, onChatVisibilityChange } = {}) {
   const [screen,   setScreen]   = useState('loading');
   const [identity, setIdentity] = useState(null);
   const [contacts, setContacts] = useState([]);
   const [active,   setActive]   = useState(null);
+
+  // Tell the parent (Vault) when we enter/leave a specific chat thread so it
+  // can collapse its top tab bar and give the chat the whole screen.
+  useEffect(() => {
+    onChatVisibilityChange?.(screen === 'chat' && !!active);
+    return () => onChatVisibilityChange?.(false);
+  }, [screen, active, onChatVisibilityChange]);
 
   useEffect(() => {
     (async () => {

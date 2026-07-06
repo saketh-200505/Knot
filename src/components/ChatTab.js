@@ -17,7 +17,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, KeyboardAvoidingView, Platform, ActivityIndicator,
-  Alert, Pressable,
+  Alert, Pressable, Animated, PanResponder,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ExpoC from 'expo-crypto';
@@ -25,63 +25,10 @@ import * as aesjs from 'aes-js';
 import { sha256 } from '@noble/hashes/sha256';
 import Constants from 'expo-constants';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
-
-// ─── 🔧 PASTE YOUR FIREBASE CONFIG HERE ──────────────────────────────────────
-const FIREBASE_CONFIG = {
-  apiKey:      'AIzaSyBHnA05bunLw23gy40u-Llxsshn9Lc3LBI',
-  databaseURL: 'https://saketh-3ee4f-default-rtdb.asia-southeast1.firebasedatabase.app',
-};
-// ─────────────────────────────────────────────────────────────────────────────
+import { fbGet, fbSet, fbPatch, roomPath } from '../utils/chatBackend';
+import { markContactRead } from '../hooks/useChatUnread';
 
 const POLL_INTERVAL = 2000; // ms — poll Firebase every 2 seconds
-
-// ─── Firebase REST ────────────────────────────────────────────────────────────
-const DB = () => FIREBASE_CONFIG.databaseURL;
-
-async function fbGet(path) {
-  try {
-    const res = await fetch(
-      `${DB()}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`
-    );
-    if (!res.ok) return { ok: false, data: null };
-    const data = await res.json();
-    return { ok: true, data };
-  } catch { return { ok: false, data: null }; }
-}
-
-async function fbSet(path, data) {
-  try {
-    const res = await fetch(
-      `${DB()}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`,
-      {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      }
-    );
-    if (!res.ok) {
-      let msg = `HTTP ${res.status}`;
-      try { const j = await res.json(); if (j?.error) msg = j.error; } catch {}
-      return { ok: false, error: msg };
-    }
-    return { ok: true };
-  } catch (e) { return { ok: false, error: e?.message || 'Network error' }; }
-}
-
-// PATCH — merge fields without wiping siblings. Used for read receipts and presence.
-async function fbPatch(path, data) {
-  try {
-    const res = await fetch(
-      `${DB()}/${path}.json?auth=${FIREBASE_CONFIG.apiKey}`,
-      {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      }
-    );
-    return { ok: res.ok };
-  } catch { return { ok: false }; }
-}
 
 // ─── Push notifications (soft — works whether expo-notifications is installed or not) ─
 // The recipient's Expo push token is published to /tokens/<pubHex> so the sender's
@@ -105,9 +52,25 @@ function pickDisguise() {
   return DISGUISE_LINES[Math.floor(Math.random() * DISGUISE_LINES.length)];
 }
 
+// Persist the last outcome locally too, so the Rooms screen can show it
+// without needing Firebase console access. This is what surfaces "Push:
+// permission denied" or "Push: rules blocked write" back to the user.
+const KEY_PUSH_STATUS = 'knot_chat_push_status'; // { ok, token, error, at, source }
+async function setPushStatus(o) {
+  try { await AsyncStorage.setItem(KEY_PUSH_STATUS, JSON.stringify({ ...o, at: Date.now() })); } catch {}
+}
+async function getPushStatus() {
+  try {
+    const raw = await AsyncStorage.getItem(KEY_PUSH_STATUS);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
 async function registerPushToken(myPubHex) {
   if (!Notifications) {
-    await fbSet(`tokens/${myPubHex}`, { error: 'expo-notifications not loaded', at: Date.now() });
+    const err = 'expo-notifications module missing (running in Expo Go?)';
+    await setPushStatus({ ok: false, error: err });
+    await fbSet(`tokens/${myPubHex}`, { error: err, at: Date.now() });
     return null;
   }
   try {
@@ -118,7 +81,9 @@ async function registerPushToken(myPubHex) {
       status = req.status;
     }
     if (status !== 'granted') {
-      await fbSet(`tokens/${myPubHex}`, { error: `permission ${status}`, at: Date.now() });
+      const err = `notifications permission not granted (${status})`;
+      await setPushStatus({ ok: false, error: err });
+      await fbSet(`tokens/${myPubHex}`, { error: err, at: Date.now() });
       return null;
     }
     // SDK 52+ requires projectId to be passed explicitly — without it the call
@@ -132,15 +97,25 @@ async function registerPushToken(myPubHex) {
     );
     const token = tokenRes?.data;
     if (!token) {
-      await fbSet(`tokens/${myPubHex}`, { error: 'empty token response', at: Date.now() });
+      const err = 'Expo returned an empty push token';
+      await setPushStatus({ ok: false, error: err });
+      await fbSet(`tokens/${myPubHex}`, { error: err, at: Date.now() });
       return null;
     }
-    await fbSet(`tokens/${myPubHex}`, { token, at: Date.now() });
+    const write = await fbSet(`tokens/${myPubHex}`, { token, at: Date.now() });
+    if (!write.ok) {
+      // Token itself is fine — the RTDB rejected the write. That's the
+      // rules-block case; surface it so the user can fix Realtime Database rules.
+      await setPushStatus({ ok: false, token, error: `RTDB rejected /tokens write: ${write.error || 'unknown'}` });
+      return null;
+    }
+    await setPushStatus({ ok: true, token });
     return token;
   } catch (e) {
     const msg = e?.message || String(e);
     console.warn('[knot-push] token registration skipped:', msg);
-    await fbSet(`tokens/${myPubHex}`, { error: msg, at: Date.now() });
+    await setPushStatus({ ok: false, error: msg });
+    await fbSet(`tokens/${myPubHex}`, { error: msg, at: Date.now() }).catch(() => {});
     return null;
   }
 }
@@ -241,10 +216,6 @@ async function setNotifEnabled(contactPubHex, on) {
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
-// Room path: sorted pubkeys joined — same on both devices
-function roomPath(a, b) {
-  return 'chats/' + [a, b].sort().join('__');
-}
 function genId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2);
 }
@@ -261,7 +232,7 @@ function timeStr(ts) {
 }
 
 // ─── ROOT ─────────────────────────────────────────────────────────────────────
-export function ChatTab() {
+export function ChatTab({ unreadPerContact = {} } = {}) {
   const [screen,   setScreen]   = useState('loading');
   const [identity, setIdentity] = useState(null);
   const [contacts, setContacts] = useState([]);
@@ -340,7 +311,8 @@ export function ChatTab() {
     <RoomsScreen
       identity={identity}
       contacts={contacts}
-      onOpen={c => { setActive(c); setScreen('chat'); }}
+      unreadPerContact={unreadPerContact}
+      onOpen={c => { markContactRead(c.pubHex).catch(() => {}); setActive(c); setScreen('chat'); }}
       onAdd={handleAdd}
       onDelete={handleDelete}
     />
@@ -394,12 +366,30 @@ function SetupScreen({ onDone }) {
 }
 
 // ─── ROOMS ────────────────────────────────────────────────────────────────────
-function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
+function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete, unreadPerContact = {} }) {
   const [showKey, setShowKey] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [name,    setName]    = useState('');
   const [pub,     setPub]     = useState('');
   const [busy,    setBusy]    = useState(false);
+  const [pushStatus, setPushStatusState] = useState(null);
+
+  // Refresh push status whenever this screen becomes visible so a fresh
+  // registerPushToken() call (fired by ChatTab on mount) updates the UI.
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => getPushStatus().then(s => { if (!cancelled) setPushStatusState(s); }).catch(() => {});
+    load();
+    const t = setInterval(load, 3000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, []);
+
+  const retryPush = useCallback(async () => {
+    if (!identity?.pubHex) return;
+    await registerPushToken(identity.pubHex);
+    const next = await getPushStatus();
+    setPushStatusState(next);
+  }, [identity?.pubHex]);
 
   const add = async () => {
     if (!name.trim()) {
@@ -436,6 +426,30 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
         </View>
       )}
 
+      {/* Push-notification diagnostic — visible so the user can see why the
+          token folder doesn't appear in Firebase, without opening the console. */}
+      <View style={[s.pushCard, pushStatus?.ok ? s.pushOk : s.pushErr]}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.pushTitle}>
+            {pushStatus == null
+              ? 'Push: checking…'
+              : pushStatus.ok
+                ? 'Push: registered ✓'
+                : 'Push: not working'}
+          </Text>
+          {!pushStatus?.ok && (
+            <Text style={s.pushMsg} numberOfLines={3}>
+              {pushStatus?.error || 'Waiting for first registration attempt…'}
+            </Text>
+          )}
+        </View>
+        {!pushStatus?.ok && (
+          <TouchableOpacity onPress={retryPush} style={s.pushRetry} activeOpacity={0.7}>
+            <Text style={s.pushRetryTxt}>Retry</Text>
+          </TouchableOpacity>
+        )}
+      </View>
+
       {contacts.length === 0 ? (
         <View style={s.emptyWrap}>
           <Text style={{ fontSize: 44, marginBottom: 12 }}>💬</Text>
@@ -447,20 +461,27 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete }) {
           data={contacts}
           keyExtractor={c => c.id}
           contentContainerStyle={{ paddingBottom: 100 }}
-          renderItem={({ item }) => (
-            <Pressable
-              style={({ pressed }) => [s.row, pressed && { backgroundColor: COLORS.surface2 }]}
-              onPress={() => onOpen(item)}
-              onLongPress={() => confirmDelete(item)}
-            >
-              <View style={s.av}><Text style={s.avTxt}>{initials(item.name)}</Text></View>
-              <View style={{ flex: 1 }}>
-                <Text style={s.rowName}>{item.name}</Text>
-                <Text style={s.rowSub}>🔒 End-to-end encrypted</Text>
-              </View>
-              <Text style={{ fontSize: 20, color: COLORS.textMuted }}>›</Text>
-            </Pressable>
-          )}
+          renderItem={({ item }) => {
+            const unread = unreadPerContact[item.pubHex] || 0;
+            return (
+              <Pressable
+                style={({ pressed }) => [s.row, pressed && { backgroundColor: COLORS.surface2 }]}
+                onPress={() => onOpen(item)}
+                onLongPress={() => confirmDelete(item)}
+              >
+                <View style={s.av}><Text style={s.avTxt}>{initials(item.name)}</Text></View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[s.rowName, unread > 0 && { color: COLORS.textPrimary }]}>{item.name}</Text>
+                  <Text style={s.rowSub}>
+                    {unread > 0 ? `${unread} new message${unread > 1 ? 's' : ''}` : '🔒 End-to-end encrypted'}
+                  </Text>
+                </View>
+                {unread > 0
+                  ? <View style={s.unreadBadge}><Text style={s.unreadBadgeTxt}>{unread > 99 ? '99+' : unread}</Text></View>
+                  : <Text style={{ fontSize: 20, color: COLORS.textMuted }}>›</Text>}
+              </Pressable>
+            );
+          }}
         />
       )}
 
@@ -524,7 +545,6 @@ function ChatScreen({ identity, contact, onBack }) {
   const readIds    = useRef(new Set()); // messages we've already patched with readAt
   const sharedKey  = useRef(null);
   const pollTimer  = useRef(null);
-  const presenceTimer = useRef(null);
   const path       = roomPath(identity.pubHex, contact.pubHex);
   const rid        = path.replace('chats/', '');
 
@@ -563,20 +583,13 @@ function ChatScreen({ identity, contact, onBack }) {
       } catch {}
       const on = await isNotifEnabled(contact.pubHex);
       setNotifOn(on);
+      // Opening the thread clears the unread count for this contact.
+      markContactRead(contact.pubHex).catch(() => {});
     })();
   }, [rid, identity.pubHex, contact.pubHex]);
 
-  // ── PRESENCE — write own, poll contact's ──────────────────────────────────
-  useEffect(() => {
-    const beat = () => fbSet(`presence/${identity.pubHex}`, { online: true, at: Date.now() });
-    beat();
-    presenceTimer.current = setInterval(beat, 15000); // heartbeat every 15s
-    return () => {
-      if (presenceTimer.current) clearInterval(presenceTimer.current);
-      // Best-effort "went offline" mark
-      fbSet(`presence/${identity.pubHex}`, { online: false, at: Date.now() }).catch(() => {});
-    };
-  }, [identity.pubHex]);
+  // Note: our own presence heartbeat is driven by the Vault-level useChatUnread
+  // hook so we still look "online" to peers when we're on any tab, not just here.
 
   const pollPresence = useCallback(async () => {
     const res = await fbGet(`presence/${contact.pubHex}`);
@@ -649,6 +662,15 @@ function ChatScreen({ identity, contact, onBack }) {
 
     if (!newMsgs.length) return;
 
+    // Any peer message that arrives while we're inside this thread counts as
+    // read — advance the last-read cursor so the Rooms list and Chat-tab
+    // badge don't keep counting it.
+    const latestPeerTs = newMsgs.reduce(
+      (mx, m) => (!m.fromMe && m.ts > mx ? m.ts : mx),
+      0,
+    );
+    if (latestPeerTs) markContactRead(contact.pubHex, latestPeerTs).catch(() => {});
+
     setMessages(prev => {
       const merged = [...prev];
       for (const msg of newMsgs) {
@@ -659,7 +681,7 @@ function ChatScreen({ identity, contact, onBack }) {
       return sorted;
     });
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
-  }, [path, identity.pubHex, pollPresence, persistMessages]);
+  }, [path, identity.pubHex, contact.pubHex, pollPresence, persistMessages]);
 
   // Start polling on mount, stop on unmount
   useEffect(() => {
@@ -786,41 +808,12 @@ function ChatScreen({ identity, contact, onBack }) {
           </View>
         }
         renderItem={({ item }) => (
-          <Pressable
-            onLongPress={() => setReplyingTo({ id: item.id, sender: item.sender, text: item.text })}
-            delayLongPress={280}
-            style={[s.bWrap, item.fromMe ? s.bWrapMe : s.bWrapThem]}
-          >
-            <View style={[
-              s.bubble,
-              item.fromMe ? s.bMe : s.bThem,
-              item.status === 'failed' && s.bFailed,
-            ]}>
-              {item.replyTo && (
-                <View style={[s.replyQuote, item.fromMe ? s.replyQuoteMe : s.replyQuoteThem]}>
-                  <Text style={s.replyName}>
-                    {item.replyTo.sender === identity.pubHex ? 'You' : contact.name}
-                  </Text>
-                  <Text style={s.replyText} numberOfLines={2}>
-                    {item.replyTo.text || '…'}
-                  </Text>
-                </View>
-              )}
-              <Text style={[s.bTxt, { color: item.fromMe ? '#fff' : COLORS.textPrimary }]}>
-                {item.text}
-              </Text>
-            </View>
-            <Text style={[s.time, { textAlign: item.fromMe ? 'right' : 'left' }]}>
-              {item.fromMe && item.status === 'sending' && '• sending  '}
-              {item.fromMe && item.status === 'failed'  && '⚠︎ not delivered  '}
-              {timeStr(item.ts)}
-              {item.fromMe && item.status !== 'sending' && item.status !== 'failed' && (
-                <Text style={{ color: item.status === 'read' ? COLORS.indigo : COLORS.textMuted }}>
-                  {'  '}{item.status === 'read' ? '✓✓' : '✓'}
-                </Text>
-              )}
-            </Text>
-          </Pressable>
+          <SwipeToReply
+            item={item}
+            identity={identity}
+            contact={contact}
+            onReply={() => setReplyingTo({ id: item.id, sender: item.sender, text: item.text })}
+          />
         )}
       />
 
@@ -871,6 +864,100 @@ function decryptReplyPreview(rp, key) {
   const text = decryptMsg(rp.ct, key);
   if (!text) return null;
   return { id: rp.id, sender: rp.sender, text };
+}
+
+// ─── SwipeToReply ────────────────────────────────────────────────────────────
+// WhatsApp-style: drag a bubble right past the threshold to fire reply.
+// PanResponder only claims the touch once the horizontal drag clearly beats
+// vertical movement, so FlatList vertical scrolling still works normally.
+const SWIPE_TRIGGER = 60;      // px drag before we fire reply
+const SWIPE_MAX     = 90;      // clamp so the bubble doesn't fly off-screen
+function SwipeToReply({ item, identity, contact, onReply }) {
+  const translateX = useRef(new Animated.Value(0)).current;
+  const firedRef   = useRef(false);
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_, g) =>
+        Math.abs(g.dx) > 12 && Math.abs(g.dx) > Math.abs(g.dy) * 1.6 && g.dx > 0,
+      onPanResponderGrant: () => { firedRef.current = false; },
+      onPanResponderMove: (_, g) => {
+        const dx = Math.max(0, Math.min(g.dx, SWIPE_MAX));
+        translateX.setValue(dx);
+        if (!firedRef.current && dx >= SWIPE_TRIGGER) {
+          firedRef.current = true;
+          onReply();
+        }
+      },
+      onPanResponderRelease: () => {
+        Animated.spring(translateX, {
+          toValue: 0,
+          useNativeDriver: true,
+          bounciness: 8,
+          speed: 18,
+        }).start();
+      },
+      onPanResponderTerminate: () => {
+        Animated.spring(translateX, { toValue: 0, useNativeDriver: true }).start();
+      },
+    })
+  ).current;
+
+  const iconOpacity = translateX.interpolate({
+    inputRange: [0, SWIPE_TRIGGER],
+    outputRange: [0, 1],
+    extrapolate: 'clamp',
+  });
+  const iconScale = translateX.interpolate({
+    inputRange: [0, SWIPE_TRIGGER],
+    outputRange: [0.6, 1],
+    extrapolate: 'clamp',
+  });
+
+  return (
+    <View style={s.swipeRow}>
+      <Animated.View
+        pointerEvents="none"
+        style={[s.replyHint, { opacity: iconOpacity, transform: [{ scale: iconScale }] }]}
+      >
+        <Text style={s.replyHintTxt}>↩</Text>
+      </Animated.View>
+      <Animated.View
+        {...panResponder.panHandlers}
+        style={[s.bWrap, item.fromMe ? s.bWrapMe : s.bWrapThem, { transform: [{ translateX }] }]}
+      >
+        <View style={[
+          s.bubble,
+          item.fromMe ? s.bMe : s.bThem,
+          item.status === 'failed' && s.bFailed,
+        ]}>
+          {item.replyTo && (
+            <View style={[s.replyQuote, item.fromMe ? s.replyQuoteMe : s.replyQuoteThem]}>
+              <Text style={s.replyName}>
+                {item.replyTo.sender === identity.pubHex ? 'You' : contact.name}
+              </Text>
+              <Text style={s.replyText} numberOfLines={2}>
+                {item.replyTo.text || '…'}
+              </Text>
+            </View>
+          )}
+          <Text style={[s.bTxt, { color: item.fromMe ? '#fff' : COLORS.textPrimary }]}>
+            {item.text}
+          </Text>
+        </View>
+        <Text style={[s.time, { textAlign: item.fromMe ? 'right' : 'left' }]}>
+          {item.fromMe && item.status === 'sending' && '• sending  '}
+          {item.fromMe && item.status === 'failed'  && '⚠︎ not delivered  '}
+          {timeStr(item.ts)}
+          {item.fromMe && item.status !== 'sending' && item.status !== 'failed' && (
+            <Text style={{ color: item.status === 'read' ? COLORS.indigo : COLORS.textMuted }}>
+              {'  '}{item.status === 'read' ? '✓✓' : '✓'}
+            </Text>
+          )}
+        </Text>
+      </Animated.View>
+    </View>
+  );
 }
 
 // ─── STYLES ───────────────────────────────────────────────────────────────────
@@ -950,4 +1037,22 @@ const s = StyleSheet.create({
   sendBtn:   { width: 36, height: 36, borderRadius: 18, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center' },
   sendBtnOff:{ backgroundColor: COLORS.surface3 },
   sendIcon:  { fontSize: 18, color: '#fff', marginTop: -1 },
+
+  // Swipe-to-reply
+  swipeRow:   { position: 'relative' },
+  replyHint:  { position: 'absolute', left: 12, top: 0, bottom: 0, width: 44, alignItems: 'center', justifyContent: 'center' },
+  replyHintTxt: { fontSize: 20, color: COLORS.indigo },
+
+  // Unread badge on room rows
+  unreadBadge: { minWidth: 22, height: 22, paddingHorizontal: 6, borderRadius: 11, backgroundColor: COLORS.indigo, alignItems: 'center', justifyContent: 'center' },
+  unreadBadgeTxt: { color: '#fff', fontSize: 12, fontFamily: FONTS.bodyMed, lineHeight: 15 },
+
+  // Push diagnostic card
+  pushCard:   { flexDirection: 'row', alignItems: 'center', marginHorizontal: SPACING.md, marginBottom: SPACING.sm, padding: SPACING.md, borderRadius: RADIUS.lg, borderWidth: 1, gap: SPACING.sm },
+  pushOk:     { backgroundColor: COLORS.surface1, borderColor: COLORS.border },
+  pushErr:    { backgroundColor: '#3a1a1a', borderColor: '#5a2a2a' },
+  pushTitle:  { fontFamily: FONTS.bodyMed, fontSize: 13, color: COLORS.textPrimary, marginBottom: 2 },
+  pushMsg:    { fontFamily: FONTS.body, fontSize: 11, color: COLORS.textMuted },
+  pushRetry:  { backgroundColor: COLORS.indigo, borderRadius: RADIUS.full, paddingHorizontal: 14, paddingVertical: 6 },
+  pushRetryTxt:{ color: '#fff', fontFamily: FONTS.bodyMed, fontSize: 12 },
 });

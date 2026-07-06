@@ -36,6 +36,7 @@ import { Toast }       from '../components/Toast';
 import { GroupPicker } from '../components/GroupPicker';
 import { ChatTab }     from '../components/ChatTab';
 import { SharedTab }   from '../components/SharedTab';
+import { useChatUnread } from '../hooks/useChatUnread';
 import { COLORS, FONTS, RADIUS, SPACING, GROUP_PALETTES } from '../utils/theme';
 import { getExternalVaultDir } from '../../modules/knot-vault-dir';
 
@@ -112,6 +113,7 @@ export function Vault({ onLogout }) {
   const session = useSession();
 
   const [tab,       setTab]       = useState(0);
+  const chatUnread                = useChatUnread();
   const [photos,    setPhotos]    = useState([]);
   const [groups,    setGroups]    = useState([]);
   const [auditLog,  setAuditLog]  = useState([]);
@@ -1208,17 +1210,27 @@ export function Vault({ onLogout }) {
           <Text style={s.appName}>My Gallery</Text>
         </View>
         <View style={s.tabTrack}>
-          {['Gallery','Shared','Chat','Settings'].map((label,i)=>(
-            <TouchableOpacity key={label} style={[s.tabBtn,tab===i&&s.tabOn]} onPress={()=>setTab(i)} activeOpacity={0.7}>
-              <Text style={[s.tabTxt,tab===i&&s.tabOnTxt]}>{label}</Text>
-            </TouchableOpacity>
-          ))}
+          {['Gallery','Shared','Chat','Settings'].map((label,i)=>{
+            const showBadge = label==='Chat' && chatUnread.total>0;
+            return (
+              <TouchableOpacity key={label} style={[s.tabBtn,tab===i&&s.tabOn]} onPress={()=>setTab(i)} activeOpacity={0.7}>
+                <View style={{flexDirection:'row',alignItems:'center',gap:6}}>
+                  <Text style={[s.tabTxt,tab===i&&s.tabOnTxt]}>{label}</Text>
+                  {showBadge && (
+                    <View style={s.tabBadge}>
+                      <Text style={s.tabBadgeTxt}>{chatUnread.total>99?'99+':chatUnread.total}</Text>
+                    </View>
+                  )}
+                </View>
+              </TouchableOpacity>
+            );
+          })}
         </View>
       </View>
 
       {tab===0 && <GalleryTab/>}
       {tab===1 && <SharedTab showToast={toast_} onSaveToVault={(b64,mime,name,done)=>setSavePending({plainB64:b64,mime,name,onDone:done})}/>}
-      {tab===2 && <ChatTab showToast={toast_} />}
+      {tab===2 && <ChatTab showToast={toast_} unreadPerContact={chatUnread.perContact} />}
       {tab===3 && <SettingsTab/>}
 
       {openGroup && <GroupView/>}
@@ -1305,6 +1317,8 @@ const s = StyleSheet.create({
   tabOn:      { backgroundColor:COLORS.surface1, shadowColor:'#000', shadowOpacity:0.08, shadowOffset:{width:0,height:1}, shadowRadius:3, elevation:2 },
   tabTxt:     { fontFamily:FONTS.body,    color:COLORS.textMuted,   fontSize:13 },
   tabOnTxt:   { fontFamily:FONTS.bodyMed, color:COLORS.textPrimary, fontSize:13 },
+  tabBadge:   { minWidth:18, height:18, paddingHorizontal:5, borderRadius:9, backgroundColor:'#FF3B30', alignItems:'center', justifyContent:'center' },
+  tabBadgeTxt:{ color:'#fff', fontSize:11, fontFamily:FONTS.bodyMed, lineHeight:14 },
   toolbar:    { flexDirection:'row', alignItems:'center', justifyContent:'space-between', paddingHorizontal:SPACING.md, paddingVertical:10 },
   toolTitle:  { fontFamily:FONTS.body, color:COLORS.textSecondary, fontSize:13 },
   solidBtn:   { backgroundColor:COLORS.indigo, borderRadius:RADIUS.md, paddingVertical:11, paddingHorizontal:18, alignItems:'center', justifyContent:'center' },

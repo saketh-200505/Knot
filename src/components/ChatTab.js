@@ -13,7 +13,7 @@
  * 4. Paste below
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, KeyboardAvoidingView, Platform, ActivityIndicator,
@@ -558,6 +558,7 @@ function ChatScreen({ identity, contact, onBack }) {
   const [notifOn,    setNotifOn]    = useState(true);
   const [replyingTo, setReplyingTo] = useState(null);
   const [editingMsg, setEditingMsg] = useState(null); // message we're editing (only own)
+  const [newMsgCount, setNewMsgCount] = useState(0); // unseen messages while scrolled up reading history
   const listRef    = useRef(null);
   const nearBottom = useRef(true);   // true while user is at/near the latest message
   const seenIds    = useRef(new Set());
@@ -607,7 +608,6 @@ function ChatScreen({ identity, contact, onBack }) {
         }
         if (cached.length) {
           setMessages(cached);
-          setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 50);
         }
       } catch {}
       const on = await isNotifEnabled(contact.pubHex);
@@ -747,10 +747,14 @@ function ChatScreen({ identity, contact, onBack }) {
       persistMessages(sorted);
       return sorted;
     });
-    // Don't yank the user down to a new message if they've scrolled up to
-    // read history — same rule the FlatList's onContentSizeChange follows.
+    // With an inverted list, staying pinned to the latest message happens
+    // automatically as long as the user is at offset 0 — no manual scroll
+    // needed. If they've scrolled up to read history, don't move them; just
+    // surface a "N new messages" indicator instead.
     if (nearBottom.current) {
-      setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
+      setNewMsgCount(0);
+    } else {
+      setNewMsgCount(c => c + newMsgs.length);
     }
   }, [path, identity.pubHex, contact.pubHex, pollPresence, persistMessages]);
 
@@ -763,13 +767,10 @@ function ChatScreen({ identity, contact, onBack }) {
     };
   }, [poll]);
 
-  // Scroll to bottom whenever the message count changes (new incoming/cached) —
-  // but only if the user hasn't scrolled up to read older messages.
-  useEffect(() => {
-    if (messages.length > 0 && nearBottom.current) {
-      setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 100);
-    }
-  }, [messages.length]);
+  // Note: with an inverted list, staying pinned to the latest message at
+  // offset 0 is native FlatList behavior — no manual scroll-on-update effect
+  // needed here anymore (that was the source of the old scroll-fighting bug).
+
 
   // Toggle notifications for this contact
   const toggleNotif = useCallback(async () => {
@@ -838,7 +839,8 @@ function ChatScreen({ identity, contact, onBack }) {
       return next;
     });
     nearBottom.current = true; // sending always snaps you back to the latest message
-    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
+    setNewMsgCount(0);
+    listRef.current?.scrollToOffset({ offset: 0, animated: true });
 
     // Write to Firebase and reconcile status
     const payload = { ct, ts, sender: identity.pubHex };
@@ -910,6 +912,9 @@ function ChatScreen({ identity, contact, onBack }) {
     ? 'online'
     : (presence.at ? `last seen ${timeStr(presence.at)}` : (online ? '🔒 End-to-end encrypted' : 'Connecting…'));
 
+  // Inverted FlatList expects newest-first data (index 0 = bottom of screen).
+  const invertedMessages = useMemo(() => [...messages].reverse(), [messages]);
+
   return (
     <KeyboardAvoidingView
       style={s.fill}
@@ -936,60 +941,65 @@ function ChatScreen({ identity, contact, onBack }) {
       </View>
 
       {/* Messages */}
-      <FlatList
-        ref={listRef}
-        data={messages}
-        keyExtractor={m => m.id}
-        contentContainerStyle={[s.msgList, messages.length === 0 && { flex: 1 }]}
-        onLayout={() => {
-          // Follow to the bottom on layout passes (mount, cache/poll data
-          // landing, keyboard toggling) as long as the user hasn't scrolled
-          // up to read history. nearBottom starts true, so this still lands
-          // on the most recent message when the chat first opens — even if
-          // the real message data arrives a moment after the first empty
-          // layout pass.
-          if (nearBottom.current) {
-            listRef.current?.scrollToEnd({ animated: false });
+      <View style={{ flex: 1 }}>
+        <FlatList
+          ref={listRef}
+          data={invertedMessages}
+          inverted
+          keyExtractor={m => m.id}
+          contentContainerStyle={[s.msgList, messages.length === 0 && { flex: 1 }]}
+          onScroll={(e) => {
+            // Inverted list: contentOffset.y === 0 means pinned to the latest
+            // message (visual bottom). Anything scrolled away from that is
+            // the user reading history — new messages must not move them.
+            const { contentOffset } = e.nativeEvent;
+            const wasNearBottom = nearBottom.current;
+            nearBottom.current = contentOffset.y < 120;
+            if (nearBottom.current && !wasNearBottom) {
+              setNewMsgCount(0); // they scrolled back down themselves — clear the indicator
+            }
+          }}
+          scrollEventThrottle={100}
+          showsVerticalScrollIndicator
+          persistentScrollbar
+          keyboardShouldPersistTaps="handled"
+          keyboardDismissMode="on-drag"
+          ListEmptyComponent={
+            <View style={[s.emptyChat, { transform: [{ scaleY: -1 }] }]}>
+              <Text style={{ fontSize: 40, marginBottom: 12 }}>🔐</Text>
+              <Text style={s.emptySub}>
+                Messages are encrypted on your device.{'\n'}
+                Only you and {contact.name} can read them.
+              </Text>
+            </View>
           }
-        }}
-        onContentSizeChange={() => {
-          // Only auto-follow to the bottom if the user was already there
-          // (e.g. a new message just arrived). If they've scrolled up to
-          // read history, a background poll updating the list must not
-          // yank them back down.
-          if (nearBottom.current) {
-            listRef.current?.scrollToEnd({ animated: true });
-          }
-        }}
-        onScroll={(e) => {
-          const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-          const distanceFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
-          nearBottom.current = distanceFromBottom < 120;
-        }}
-        scrollEventThrottle={100}
-        showsVerticalScrollIndicator
-        persistentScrollbar
-        keyboardShouldPersistTaps="handled"
-        keyboardDismissMode="on-drag"
-        ListEmptyComponent={
-          <View style={s.emptyChat}>
-            <Text style={{ fontSize: 40, marginBottom: 12 }}>🔐</Text>
-            <Text style={s.emptySub}>
-              Messages are encrypted on your device.{'\n'}
-              Only you and {contact.name} can read them.
+          renderItem={({ item }) => (
+            <SwipeToReply
+              item={item}
+              identity={identity}
+              contact={contact}
+              onReply={() => setReplyingTo({ id: item.id, sender: item.sender, text: item.text })}
+              onLongPress={() => openMessageActions(item)}
+            />
+          )}
+        />
+
+        {newMsgCount > 0 && (
+          <TouchableOpacity
+            style={s.newMsgPill}
+            activeOpacity={0.85}
+            onPress={() => {
+              listRef.current?.scrollToOffset({ offset: 0, animated: true });
+              nearBottom.current = true;
+              setNewMsgCount(0);
+            }}
+          >
+            <Text style={s.newMsgPillText}>
+              ↓ {newMsgCount} new message{newMsgCount > 1 ? 's' : ''}
             </Text>
-          </View>
-        }
-        renderItem={({ item }) => (
-          <SwipeToReply
-            item={item}
-            identity={identity}
-            contact={contact}
-            onReply={() => setReplyingTo({ id: item.id, sender: item.sender, text: item.text })}
-            onLongPress={() => openMessageActions(item)}
-          />
+          </TouchableOpacity>
         )}
-      />
+      </View>
 
       {/* Edit banner (takes priority over reply preview) */}
       {editingMsg ? (
@@ -1215,6 +1225,13 @@ const s = StyleSheet.create({
   fabTxt:    { fontSize: 28, color: '#fff', lineHeight: 32, marginTop: -2 },
 
   msgList:   { paddingHorizontal: SPACING.md, paddingBottom: SPACING.lg, paddingTop: SPACING.sm },
+  newMsgPill: {
+    position: 'absolute', left: SPACING.md, bottom: SPACING.md,
+    backgroundColor: COLORS.indigo, paddingVertical: 8, paddingHorizontal: 14,
+    borderRadius: RADIUS.full, elevation: 4,
+    shadowColor: '#000', shadowOpacity: 0.25, shadowRadius: 6, shadowOffset: { width: 0, height: 2 },
+  },
+  newMsgPillText: { fontFamily: FONTS.bodyMed, fontSize: 13, color: '#fff' },
   bWrap:     { marginBottom: 3 },
   bWrapMe:   { alignItems: 'flex-end' },
   bWrapThem: { alignItems: 'flex-start' },

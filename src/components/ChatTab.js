@@ -559,6 +559,7 @@ function ChatScreen({ identity, contact, onBack }) {
   const [replyingTo, setReplyingTo] = useState(null);
   const [editingMsg, setEditingMsg] = useState(null); // message we're editing (only own)
   const listRef    = useRef(null);
+  const nearBottom = useRef(true);   // true while user is at/near the latest message
   const seenIds    = useRef(new Set());
   const readIds    = useRef(new Set()); // messages we've already patched with readAt
   const remoteMeta = useRef(new Map()); // id -> { editedAt, deleted } for reconcile
@@ -746,7 +747,11 @@ function ChatScreen({ identity, contact, onBack }) {
       persistMessages(sorted);
       return sorted;
     });
-    setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
+    // Don't yank the user down to a new message if they've scrolled up to
+    // read history — same rule the FlatList's onContentSizeChange follows.
+    if (nearBottom.current) {
+      setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
+    }
   }, [path, identity.pubHex, contact.pubHex, pollPresence, persistMessages]);
 
   // Start polling on mount, stop on unmount
@@ -758,9 +763,10 @@ function ChatScreen({ identity, contact, onBack }) {
     };
   }, [poll]);
 
-  // Scroll to bottom whenever the message count changes (new incoming/cached)
+  // Scroll to bottom whenever the message count changes (new incoming/cached) —
+  // but only if the user hasn't scrolled up to read older messages.
   useEffect(() => {
-    if (messages.length > 0) {
+    if (messages.length > 0 && nearBottom.current) {
       setTimeout(() => listRef.current?.scrollToEnd({ animated: false }), 100);
     }
   }, [messages.length]);
@@ -831,6 +837,7 @@ function ChatScreen({ identity, contact, onBack }) {
       persistMessages(next);
       return next;
     });
+    nearBottom.current = true; // sending always snaps you back to the latest message
     setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 80);
 
     // Write to Firebase and reconcile status
@@ -934,8 +941,32 @@ function ChatScreen({ identity, contact, onBack }) {
         data={messages}
         keyExtractor={m => m.id}
         contentContainerStyle={[s.msgList, messages.length === 0 && { flex: 1 }]}
-        onLayout={() => listRef.current?.scrollToEnd({ animated: false })}
-        onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+        onLayout={() => {
+          // Follow to the bottom on layout passes (mount, cache/poll data
+          // landing, keyboard toggling) as long as the user hasn't scrolled
+          // up to read history. nearBottom starts true, so this still lands
+          // on the most recent message when the chat first opens — even if
+          // the real message data arrives a moment after the first empty
+          // layout pass.
+          if (nearBottom.current) {
+            listRef.current?.scrollToEnd({ animated: false });
+          }
+        }}
+        onContentSizeChange={() => {
+          // Only auto-follow to the bottom if the user was already there
+          // (e.g. a new message just arrived). If they've scrolled up to
+          // read history, a background poll updating the list must not
+          // yank them back down.
+          if (nearBottom.current) {
+            listRef.current?.scrollToEnd({ animated: true });
+          }
+        }}
+        onScroll={(e) => {
+          const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+          const distanceFromBottom = contentSize.height - contentOffset.y - layoutMeasurement.height;
+          nearBottom.current = distanceFromBottom < 120;
+        }}
+        scrollEventThrottle={100}
         showsVerticalScrollIndicator
         persistentScrollbar
         keyboardShouldPersistTaps="handled"

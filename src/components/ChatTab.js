@@ -17,7 +17,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, KeyboardAvoidingView, Platform, ActivityIndicator,
-  Alert, Pressable, Animated, PanResponder,
+  Alert, Pressable, Animated, PanResponder, BackHandler,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ExpoC from 'expo-crypto';
@@ -157,14 +157,31 @@ function hexToBytes(hex) {
   return out;
 }
 
+// Proper UTF-8 encode/decode that handles 4-byte sequences (emojis).
+// aes-js's built-in utf8.fromBytes only handles up to 3-byte sequences, so
+// any emoji (U+10000 and above) comes out as CJK/Arabic garbage — that's what
+// caused "emojis received as Japanese/Chinese characters". The escape/
+// decodeURIComponent trick round-trips any valid UTF-8 through the JS engine's
+// own URI codec, which handles the full Unicode range.
+function utf8Encode(str) {
+  const s = unescape(encodeURIComponent(str));
+  const arr = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) arr[i] = s.charCodeAt(i);
+  return arr;
+}
+function utf8Decode(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  try { return decodeURIComponent(escape(s)); } catch { return s; }
+}
+
 // Shared key = sha256(sortedPubA + sortedPubB)
 // Sorted so BOTH sides always derive the EXACT same key regardless of who calls it
 // Phone A: sha256(A_pub + B_pub)  — after sorting
 // Phone B: sha256(A_pub + B_pub)  — same result ✅
 function deriveSharedKey(myPubHex, theirPubHex) {
   const sorted = [myPubHex, theirPubHex].sort().join('');
-  const input  = aesjs.utils.utf8.toBytes(sorted);
-  return sha256(input);
+  return sha256(utf8Encode(sorted));
 }
 
 function encryptMsg(text, keyBytes) {
@@ -173,7 +190,7 @@ function encryptMsg(text, keyBytes) {
   iv[0] = (ts >> 24) & 0xff; iv[1] = (ts >> 16) & 0xff;
   iv[2] = (ts >>  8) & 0xff; iv[3] =  ts        & 0xff;
   for (let i = 4; i < 16; i++) iv[i] = Math.floor(Math.random() * 256);
-  const plain  = aesjs.utils.utf8.toBytes(text);
+  const plain  = utf8Encode(text);
   const ctr    = new aesjs.ModeOfOperation.ctr(keyBytes, new aesjs.Counter(iv));
   const cipher = ctr.encrypt(plain);
   const out    = new Uint8Array(16 + cipher.length);
@@ -192,7 +209,7 @@ function decryptMsg(b64, keyBytes) {
     const cipher = data.slice(16);
     const ctr    = new aesjs.ModeOfOperation.ctr(keyBytes, new aesjs.Counter(iv));
     const plain  = ctr.decrypt(cipher);
-    return aesjs.utils.utf8.fromBytes(plain);
+    return utf8Decode(plain);
   } catch { return null; }
 }
 
@@ -433,29 +450,22 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete, unreadPerCon
         </View>
       )}
 
-      {/* Push-notification diagnostic — visible so the user can see why the
-          token folder doesn't appear in Firebase, without opening the console. */}
-      <View style={[s.pushCard, pushStatus?.ok ? s.pushOk : s.pushErr]}>
-        <View style={{ flex: 1 }}>
-          <Text style={s.pushTitle}>
-            {pushStatus == null
-              ? 'Push: checking…'
-              : pushStatus.ok
-                ? 'Push: registered ✓'
-                : 'Push: not working'}
-          </Text>
-          {!pushStatus?.ok && (
+      {/* Push-notification diagnostic — only surfaced when something is wrong,
+          so it acts as a real error banner instead of dashboard noise. Once
+          push is registered ✓ we stay silent. */}
+      {pushStatus && pushStatus.ok === false && (
+        <View style={[s.pushCard, s.pushErr]}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.pushTitle}>Push: not working</Text>
             <Text style={s.pushMsg} numberOfLines={3}>
-              {pushStatus?.error || 'Waiting for first registration attempt…'}
+              {pushStatus.error || 'Waiting for first registration attempt…'}
             </Text>
-          )}
-        </View>
-        {!pushStatus?.ok && (
+          </View>
           <TouchableOpacity onPress={retryPush} style={s.pushRetry} activeOpacity={0.7}>
             <Text style={s.pushRetryTxt}>Retry</Text>
           </TouchableOpacity>
-        )}
-      </View>
+        </View>
+      )}
 
       {contacts.length === 0 ? (
         <View style={s.emptyWrap}>
@@ -547,13 +557,24 @@ function ChatScreen({ identity, contact, onBack }) {
   const [presence,   setPresence]   = useState({ online: false, at: 0 });
   const [notifOn,    setNotifOn]    = useState(true);
   const [replyingTo, setReplyingTo] = useState(null);
+  const [editingMsg, setEditingMsg] = useState(null); // message we're editing (only own)
   const listRef    = useRef(null);
   const seenIds    = useRef(new Set());
   const readIds    = useRef(new Set()); // messages we've already patched with readAt
+  const remoteMeta = useRef(new Map()); // id -> { editedAt, deleted } for reconcile
   const sharedKey  = useRef(null);
   const pollTimer  = useRef(null);
   const path       = roomPath(identity.pubHex, contact.pubHex);
   const rid        = path.replace('chats/', '');
+
+  // Android hardware/gesture back: leave the chat instead of exiting the app.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      onBack?.();
+      return true;
+    });
+    return () => sub.remove();
+  }, [onBack]);
 
   const persistMessages = useCallback((list) => {
     AsyncStorage.getItem(KEY_MSG).then(raw => {
@@ -619,6 +640,8 @@ function ChatScreen({ identity, contact, onBack }) {
 
     const newMsgs = [];
     const receiptUpdates = []; // { id, readAt } — messages of ours that got read
+    const editUpdates    = []; // { id, text, editedAt } — an already-seen message got edited
+    const deleteUpdates  = []; // ids of already-seen messages that got deleted
     const toMarkRead = [];     // incoming messages we should PATCH readAt on
 
     for (const [id, m] of Object.entries(data)) {
@@ -628,8 +651,25 @@ function ChatScreen({ identity, contact, onBack }) {
       if (m.sender === identity.pubHex && m.readAt) {
         receiptUpdates.push({ id, readAt: m.readAt });
       }
-      if (seenIds.current.has(id)) continue;
+
+      // Edit / soft-delete reconciliation for messages we already have
+      if (seenIds.current.has(id)) {
+        const prev = remoteMeta.current.get(id) || {};
+        if (m.deleted && !prev.deleted) {
+          deleteUpdates.push(id);
+          remoteMeta.current.set(id, { ...prev, deleted: true });
+        } else if (m.editedAt && m.editedAt !== prev.editedAt) {
+          const newText = decryptMsg(m.ct, sharedKey.current);
+          if (newText != null) {
+            editUpdates.push({ id, text: newText, editedAt: m.editedAt });
+            remoteMeta.current.set(id, { ...prev, editedAt: m.editedAt });
+          }
+        }
+        continue;
+      }
+
       seenIds.current.add(id);
+      remoteMeta.current.set(id, { editedAt: m.editedAt || null, deleted: !!m.deleted });
       const text = decryptMsg(m.ct, sharedKey.current);
       if (!text) continue;
 
@@ -638,12 +678,31 @@ function ChatScreen({ identity, contact, onBack }) {
         id, text, ts: m.ts, sender: m.sender, fromMe,
         replyTo: m.replyTo ? decryptReplyPreview(m.replyTo, sharedKey.current) : null,
         readAt: m.readAt || null,
+        editedAt: m.editedAt || null,
+        deleted: !!m.deleted,
         status: fromMe ? (m.readAt ? 'read' : 'sent') : undefined,
       };
       newMsgs.push(item);
 
       // If it's incoming and we haven't already told the peer we read it, queue it
-      if (!fromMe && !readIds.current.has(id)) toMarkRead.push(id);
+      if (!fromMe && !m.deleted && !readIds.current.has(id)) toMarkRead.push(id);
+    }
+
+    // Apply edits / deletes to existing state (before appending newcomers)
+    if (editUpdates.length || deleteUpdates.length) {
+      setMessages(prev => {
+        const eMap = new Map(editUpdates.map(u => [u.id, u]));
+        const dSet = new Set(deleteUpdates);
+        let changed = false;
+        const next = prev.map(m => {
+          if (dSet.has(m.id) && !m.deleted) { changed = true; return { ...m, deleted: true, text: '' }; }
+          const e = eMap.get(m.id);
+          if (e && m.editedAt !== e.editedAt) { changed = true; return { ...m, text: e.text, editedAt: e.editedAt }; }
+          return m;
+        });
+        if (changed) persistMessages(next);
+        return changed ? next : prev;
+      });
     }
 
     // Apply read receipts to our own outgoing messages (already in state)
@@ -713,10 +772,37 @@ function ChatScreen({ identity, contact, onBack }) {
     await setNotifEnabled(contact.pubHex, next);
   }, [notifOn, contact.pubHex]);
 
-  // Send message
+  // Send message (or commit an in-flight edit)
   const send = useCallback(async () => {
     const text = input.trim();
     if (!text || sending || !sharedKey.current) return;
+
+    // Edit path — patch the existing Firebase entry with new ciphertext + editedAt.
+    if (editingMsg) {
+      const target = editingMsg;
+      setSending(true);
+      setInput('');
+      setEditingMsg(null);
+      const editedAt = Date.now();
+      const ct = encryptMsg(text, sharedKey.current);
+      setMessages(prev => {
+        const next = prev.map(m => m.id === target.id ? { ...m, text, editedAt } : m);
+        persistMessages(next);
+        return next;
+      });
+      const res = await fbPatch(`${path}/${target.id}`, { ct, editedAt });
+      if (!res.ok) {
+        Alert.alert('Edit failed', res.error || 'Please try again.');
+      } else {
+        // Track our own edit so the poll's reconciler doesn't re-echo it as a
+        // remote edit and clobber the state we just set.
+        const prev = remoteMeta.current.get(target.id) || {};
+        remoteMeta.current.set(target.id, { ...prev, editedAt });
+      }
+      setSending(false);
+      return;
+    }
+
     setSending(true);
     setInput('');
     const replySnapshot = replyingTo;
@@ -739,6 +825,7 @@ function ChatScreen({ identity, contact, onBack }) {
       replyTo: replySnapshot ? { id: replySnapshot.id, sender: replySnapshot.sender, text: replySnapshot.text } : null,
     };
     seenIds.current.add(id);
+    remoteMeta.current.set(id, { editedAt: null, deleted: false });
     setMessages(prev => {
       const next = [...prev, msg].sort((a, b) => a.ts - b.ts);
       persistMessages(next);
@@ -767,7 +854,50 @@ function ChatScreen({ identity, contact, onBack }) {
       sendPushTo(contact.pubHex).catch(() => {});
     }
     setSending(false);
-  }, [input, sending, identity, path, replyingTo, notifOn, contact.pubHex, persistMessages]);
+  }, [input, sending, identity, path, replyingTo, editingMsg, notifOn, contact.pubHex, persistMessages]);
+
+  // Long-press action sheet: reply / edit (own only) / delete
+  const openMessageActions = useCallback((m) => {
+    if (m.deleted) return;
+    const actions = [
+      { text: 'Reply', onPress: () => setReplyingTo({ id: m.id, sender: m.sender, text: m.text }) },
+    ];
+    if (m.fromMe) {
+      actions.push({
+        text: 'Edit',
+        onPress: () => { setEditingMsg({ id: m.id, sender: m.sender }); setInput(m.text); setReplyingTo(null); },
+      });
+      actions.push({
+        text: 'Delete',
+        style: 'destructive',
+        onPress: () => {
+          Alert.alert('Delete message?', 'This removes it for both of you.', [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Delete', style: 'destructive', onPress: async () => {
+              setMessages(prev => {
+                const next = prev.map(x => x.id === m.id ? { ...x, deleted: true, text: '' } : x);
+                persistMessages(next);
+                return next;
+              });
+              const prevMeta = remoteMeta.current.get(m.id) || {};
+              remoteMeta.current.set(m.id, { ...prevMeta, deleted: true });
+              // Soft-delete via PATCH so the peer's poll can pick up the flag;
+              // hard DELETE would just make the id vanish silently on their side.
+              const res = await fbPatch(`${path}/${m.id}`, { deleted: true });
+              if (!res.ok) Alert.alert('Delete failed', res.error || 'Please try again.');
+            }},
+          ]);
+        },
+      });
+    }
+    actions.push({ text: 'Cancel', style: 'cancel' });
+    Alert.alert('Message', undefined, actions);
+  }, [path, persistMessages]);
+
+  const cancelEdit = useCallback(() => {
+    setEditingMsg(null);
+    setInput('');
+  }, []);
 
   const presenceLabel = presence.online
     ? 'online'
@@ -805,6 +935,11 @@ function ChatScreen({ identity, contact, onBack }) {
         keyExtractor={m => m.id}
         contentContainerStyle={[s.msgList, messages.length === 0 && { flex: 1 }]}
         onLayout={() => listRef.current?.scrollToEnd({ animated: false })}
+        onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
+        showsVerticalScrollIndicator
+        persistentScrollbar
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="on-drag"
         ListEmptyComponent={
           <View style={s.emptyChat}>
             <Text style={{ fontSize: 40, marginBottom: 12 }}>🔐</Text>
@@ -820,12 +955,23 @@ function ChatScreen({ identity, contact, onBack }) {
             identity={identity}
             contact={contact}
             onReply={() => setReplyingTo({ id: item.id, sender: item.sender, text: item.text })}
+            onLongPress={() => openMessageActions(item)}
           />
         )}
       />
 
-      {/* Reply preview */}
-      {replyingTo && (
+      {/* Edit banner (takes priority over reply preview) */}
+      {editingMsg ? (
+        <View style={[s.replyBar, { backgroundColor: COLORS.indigoDim }]}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.replyBarName}>Editing your message</Text>
+            <Text style={s.replyBarText} numberOfLines={1}>{input}</Text>
+          </View>
+          <TouchableOpacity onPress={cancelEdit} hitSlop={{top:8,bottom:8,left:8,right:8}}>
+            <Text style={{ fontSize: 16, color: COLORS.textMuted }}>✕</Text>
+          </TouchableOpacity>
+        </View>
+      ) : replyingTo && (
         <View style={s.replyBar}>
           <View style={{ flex: 1 }}>
             <Text style={s.replyBarName}>
@@ -843,7 +989,7 @@ function ChatScreen({ identity, contact, onBack }) {
       <View style={s.inputBar}>
         <TextInput
           style={s.msgInp}
-          placeholder="Message…"
+          placeholder={editingMsg ? 'Edit message…' : 'Message…'}
           placeholderTextColor={COLORS.textMuted}
           value={input}
           onChangeText={setInput}
@@ -858,7 +1004,7 @@ function ChatScreen({ identity, contact, onBack }) {
         >
           {sending
             ? <ActivityIndicator color="#fff" size="small" />
-            : <Text style={s.sendIcon}>↑</Text>}
+            : <Text style={s.sendIcon}>{editingMsg ? '✓' : '↑'}</Text>}
         </TouchableOpacity>
       </View>
     </KeyboardAvoidingView>
@@ -879,21 +1025,31 @@ function decryptReplyPreview(rp, key) {
 // vertical movement, so FlatList vertical scrolling still works normally.
 const SWIPE_TRIGGER = 60;      // px drag before we fire reply
 const SWIPE_MAX     = 90;      // clamp so the bubble doesn't fly off-screen
-function SwipeToReply({ item, identity, contact, onReply }) {
+function SwipeToReply({ item, identity, contact, onReply, onLongPress }) {
   const translateX = useRef(new Animated.Value(0)).current;
   const firedRef   = useRef(false);
+  // Latest handlers held in refs so the PanResponder — created once and never
+  // rebuilt — always calls the current callbacks. Without this, a swipe made
+  // after the keyboard opened would fire the *first* onReply closure, which
+  // often had stale state and looked like "reply doesn't work with keyboard".
+  const onReplyRef = useRef(onReply);
+  onReplyRef.current = onReply;
 
   const panResponder = useRef(
     PanResponder.create({
+      // Claim capture-phase too so a focused TextInput's touch-target above
+      // this row can't swallow the drag before we see it.
       onMoveShouldSetPanResponder: (_, g) =>
-        Math.abs(g.dx) > 12 && Math.abs(g.dx) > Math.abs(g.dy) * 1.6 && g.dx > 0,
+        Math.abs(g.dx) > 10 && Math.abs(g.dx) > Math.abs(g.dy) * 1.4 && g.dx > 0,
+      onMoveShouldSetPanResponderCapture: (_, g) =>
+        Math.abs(g.dx) > 10 && Math.abs(g.dx) > Math.abs(g.dy) * 1.4 && g.dx > 0,
       onPanResponderGrant: () => { firedRef.current = false; },
       onPanResponderMove: (_, g) => {
         const dx = Math.max(0, Math.min(g.dx, SWIPE_MAX));
         translateX.setValue(dx);
         if (!firedRef.current && dx >= SWIPE_TRIGGER) {
           firedRef.current = true;
-          onReply();
+          onReplyRef.current?.();
         }
       },
       onPanResponderRelease: () => {
@@ -921,6 +1077,7 @@ function SwipeToReply({ item, identity, contact, onReply }) {
     extrapolate: 'clamp',
   });
 
+  const isDeleted = !!item.deleted;
   return (
     <View style={s.swipeRow}>
       <Animated.View
@@ -933,12 +1090,17 @@ function SwipeToReply({ item, identity, contact, onReply }) {
         {...panResponder.panHandlers}
         style={[s.bWrap, item.fromMe ? s.bWrapMe : s.bWrapThem, { transform: [{ translateX }] }]}
       >
-        <View style={[
-          s.bubble,
-          item.fromMe ? s.bMe : s.bThem,
-          item.status === 'failed' && s.bFailed,
-        ]}>
-          {item.replyTo && (
+        <Pressable
+          onLongPress={onLongPress}
+          delayLongPress={280}
+          style={[
+            s.bubble,
+            item.fromMe ? s.bMe : s.bThem,
+            item.status === 'failed' && s.bFailed,
+            isDeleted && s.bDeleted,
+          ]}
+        >
+          {item.replyTo && !isDeleted && (
             <View style={[s.replyQuote, item.fromMe ? s.replyQuoteMe : s.replyQuoteThem]}>
               <Text style={s.replyName}>
                 {item.replyTo.sender === identity.pubHex ? 'You' : contact.name}
@@ -948,15 +1110,20 @@ function SwipeToReply({ item, identity, contact, onReply }) {
               </Text>
             </View>
           )}
-          <Text style={[s.bTxt, { color: item.fromMe ? '#fff' : COLORS.textPrimary }]}>
-            {item.text}
+          <Text style={[
+            s.bTxt,
+            { color: item.fromMe ? '#fff' : COLORS.textPrimary },
+            isDeleted && { fontStyle: 'italic', opacity: 0.75 },
+          ]}>
+            {isDeleted ? 'This message was deleted' : item.text}
           </Text>
-        </View>
+        </Pressable>
         <Text style={[s.time, { textAlign: item.fromMe ? 'right' : 'left' }]}>
           {item.fromMe && item.status === 'sending' && '• sending  '}
           {item.fromMe && item.status === 'failed'  && '⚠︎ not delivered  '}
           {timeStr(item.ts)}
-          {item.fromMe && item.status !== 'sending' && item.status !== 'failed' && (
+          {item.editedAt && !isDeleted && <Text style={{ color: COLORS.textMuted }}>{'  (edited)'}</Text>}
+          {item.fromMe && item.status !== 'sending' && item.status !== 'failed' && !isDeleted && (
             <Text style={{ color: item.status === 'read' ? COLORS.indigo : COLORS.textMuted }}>
               {'  '}{item.status === 'read' ? '✓✓' : '✓'}
             </Text>
@@ -1025,6 +1192,7 @@ const s = StyleSheet.create({
   bMe:       { backgroundColor: COLORS.indigo, borderBottomRightRadius: 5 },
   bThem:     { backgroundColor: COLORS.surface3, borderBottomLeftRadius: 5 },
   bFailed:   { opacity: 0.55, borderWidth: 1, borderColor: COLORS.rose },
+  bDeleted:  { backgroundColor: COLORS.surface2, borderWidth: 1, borderColor: COLORS.border },
 
   replyQuote:     { borderLeftWidth: 3, paddingLeft: SPACING.sm, paddingRight: SPACING.sm, paddingVertical: 4, borderRadius: 4, marginBottom: 6 },
   replyQuoteMe:   { borderLeftColor: 'rgba(255,255,255,0.7)', backgroundColor: 'rgba(255,255,255,0.14)' },

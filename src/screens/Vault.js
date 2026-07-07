@@ -5,7 +5,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   Image, FlatList, Dimensions, Animated, Platform, PanResponder,
-  Alert, ActivityIndicator, TextInput, InteractionManager,
+  Alert, ActivityIndicator, TextInput, InteractionManager, BackHandler,
 } from 'react-native';
 import * as ImagePicker  from 'expo-image-picker';
 import * as FileSystem   from 'expo-file-system';
@@ -217,6 +217,34 @@ export function Vault({ onLogout }) {
   }, []);
   useEffect(() => { if (tab===3) { loadAudit(); loadGroups(); } }, [tab]);
   useEffect(() => { if (session.showExtend) setShowExtend(true); }, [session.showExtend]);
+
+  // Android hardware/gesture back — unwind whatever's on top instead of
+  // letting the OS kill the app. Order matches visual depth: most modal first.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (showChPw)         { setShowChPw(false); return true; }
+      if (showUnlock)       { setShowUnlock(false); setUnlockGroup(null); return true; }
+      if (showExtend)       { setShowExtend(false); session.wipe(); return true; }
+      if (showExport)       { setShowExport(false); return true; }
+      if (showShareDecrypt) { setShowShareDecrypt(false); setShareDecryptIds(null); return true; }
+      if (showNewPass)      { setShowNewPass(false); setPending([]); setSaveViaNew(false); return true; }
+      if (showExistingPass) { setShowExistingPass(null); setPending([]); return true; }
+      if (showNewLabel)     { setShowNewLabel(false); setPending([]); setSaveViaNew(false); setNewLabelError(''); return true; }
+      if (showGroupPick)    { setShowGroupPick(false); setPending([]); return true; }
+      if (saveGroup)        { setSaveGroup(null); return true; }
+      if (savePending)      { setSavePending(null); return true; }
+      if (viewVideo)        { setViewVideo(null); return true; }
+      if (viewPhoto)        { setViewPhoto(null); return true; }
+      if (selectMode)       { setSelectMode(false); setSelected(new Set()); return true; }
+      if (openGroup)        { setOpenGroup(null); return true; }
+      if (tab !== 0)        { setTab(0); return true; }
+      // Root of vault — bail out to the game rather than closing the app.
+      session.wipe(); onLogout?.(); return true;
+    });
+    return () => sub.remove();
+  }, [showChPw, showUnlock, showExtend, showExport, showShareDecrypt, showNewPass,
+      showExistingPass, showNewLabel, showGroupPick, saveGroup, savePending,
+      viewVideo, viewPhoto, selectMode, openGroup, tab, session, onLogout]);
 
   // ── IMPORT ────────────────────────────────────────────────────────────────
   const pickMedia = async () => {
@@ -1231,7 +1259,15 @@ export function Vault({ onLogout }) {
         </View>
       )}
 
-      {tab===0 && <GalleryTab/>}
+      {/* Invoke the inline tabs as functions (not <Component />) so React
+          reconciles them at the SAME position each render. Because these
+          function components are defined inside Vault, their identity changes
+          every render — and Vault re-renders every second while session.remaining
+          ticks. Rendering them as <GalleryTab /> made React unmount+remount
+          the whole subtree on every tick, wiping ScrollView / FlatList
+          scroll position. Calling them inline keeps the ScrollView/FlatList
+          instances stable, so scroll position sticks. */}
+      {tab===0 && GalleryTab()}
       {tab===1 && <SharedTab showToast={toast_} onSaveToVault={(b64,mime,name,done)=>setSavePending({plainB64:b64,mime,name,onDone:done})}/>}
       {tab===2 && (
         <ChatTab
@@ -1240,10 +1276,10 @@ export function Vault({ onLogout }) {
           onChatVisibilityChange={setChatFull}
         />
       )}
-      {tab===3 && <SettingsTab/>}
+      {tab===3 && SettingsTab()}
 
-      {openGroup && <GroupView/>}
-      <PhotoViewer/>
+      {openGroup && GroupView()}
+      {PhotoViewer()}
       <VideoViewer
         viewVideo={viewVideo}
         onClose={()=>setViewVideo(null)}

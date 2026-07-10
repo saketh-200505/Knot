@@ -89,7 +89,7 @@ export function useSession() {
 
         const sealed = base64ToUint8(photo.sealedB64);
         const plain  = photo.key
-          ? unsealWithKey(sealed, photo.key)
+          ? await unsealWithKey(sealed, photo.key)
           : await unseal(sealed, passphrase, {
               iterations: photo.kdfIterations || LEGACY_KDF_ITERATIONS,
             });

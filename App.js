@@ -3,6 +3,7 @@ import { View, StyleSheet, StatusBar } from 'react-native';
 import { useFonts, Syne_700Bold, Syne_800ExtraBold } from '@expo-google-fonts/syne';
 import { DMSans_400Regular, DMSans_500Medium } from '@expo-google-fonts/dm-sans';
 import { SpaceMono_400Regular } from '@expo-google-fonts/space-mono';
+import { preventScreenCaptureAsync } from 'expo-screen-capture';
 import { isOnboarded } from './src/utils/storage';
 import { Onboarding } from './src/screens/Onboarding';
 import { SnakeGame } from './src/screens/SnakeGame';
@@ -15,6 +16,17 @@ const ROUTES = { LOADING:'loading', ONBOARDING:'onboarding', GAME:'game', LOGIN:
 
 export default function App() {
   const [route, setRoute] = useState(ROUTES.LOADING);
+
+  // Blocks screenshots AND screen recording at the OS level, for as long as
+  // the app is in the foreground — not just while inside the Vault. On
+  // Android this sets FLAG_SECURE (redundant with, but no conflict with,
+  // the native withFlagSecure plugin). On iOS there's no true "block the
+  // screenshot" API, so this uses the standard secure-layer technique:
+  // the OS still lets the screenshot/recording happen, but the app's
+  // content renders as black in the captured image/video.
+  useEffect(() => {
+    preventScreenCaptureAsync().catch(() => {});
+  }, []);
 
   const [fontsLoaded, fontError] = useFonts({
     Syne_700Bold, Syne_800ExtraBold,

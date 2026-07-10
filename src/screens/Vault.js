@@ -14,7 +14,7 @@ import * as Sharing      from 'expo-sharing';
 import { Video, ResizeMode } from 'expo-av';
 import {
   seal, sealWithKey, unseal,
-  deriveKey, randomBytes,
+  deriveKey, deriveKeyLegacy, randomBytes, getSaltBytes,
   base64ToUint8, uint8ToBase64,
   hashStr, verifyHash,
   passphraseFingerprint,
@@ -359,8 +359,8 @@ export function Vault({ onLogout }) {
       mimeType:  asset.mimeType||(isVid?'video/mp4':'image/jpeg'),
       mediaType: isVid?'video':'image',
       name:      asset.fileName||`${isVid?'video':'photo'}_${id}`,
-      addedAt:   Date.now(), cryptoVersion:3,
-      kdfIterations: DEFAULT_KDF_ITERATIONS,
+      addedAt:   Date.now(), cryptoVersion:4,
+      kdfIterations: null, // v2 format is self-describing; only legacy files use this
       groupId:   group?.id||null, groupLabel: group?.label||null,
     };
   };
@@ -379,7 +379,11 @@ export function Vault({ onLogout }) {
       if (group) await ensureDir(`${VAULT_DIR}${group.id}/`);
     }
     const salt = group ? base64ToUint8(group.salt) : null;
-    const key  = group ? deriveKey(passphrase, salt, DEFAULT_KDF_ITERATIONS) : null;
+    const key  = group
+      ? (group.kdf === 'argon2id'
+          ? await deriveKey(passphrase, salt)
+          : deriveKeyLegacy(passphrase, salt, DEFAULT_KDF_ITERATIONS))
+      : null;
     let count  = 0;
     let firstErr = null;
     for (const asset of files) {
@@ -456,11 +460,11 @@ export function Vault({ onLogout }) {
     try {
       setProc('Creating group…');
       const fp   = await passphraseFingerprint(pw);
-      const salt = await randomBytes(16);
+      const salt = await randomBytes(await getSaltBytes());
       const g    = {
         id:genId(), label:labelNow, fingerprint:fp,
         salt:uint8ToBase64(salt), color, paletteIdx,
-        createdAt:Date.now(),
+        createdAt:Date.now(), kdf:'argon2id',
       };
       await addGroup(g);
       await loadGroups();
@@ -486,13 +490,15 @@ export function Vault({ onLogout }) {
     const fp = await passphraseFingerprint(pw);
     if (tg && tg.id!=='__ungrouped') {
       if (tg.fingerprint!==fp) return {targets:[],labels:[],wrong:true};
-      const salt=base64ToUint8(tg.salt), key=deriveKey(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const salt=base64ToUint8(tg.salt);
+      const key = tg.kdf === 'argon2id' ? await deriveKey(pw,salt) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
       return { targets:photos.filter(p=>p.groupId===tg.id).map(p=>({photo:p,key})), labels:[tg.label], wrong:false };
     }
     const matching = await findGroupsByFingerprint(fp);
     const targets=[]; const labels=[];
     for (const g of matching) {
-      const salt=base64ToUint8(g.salt), key=deriveKey(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const salt=base64ToUint8(g.salt);
+      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
       photos.filter(p=>p.groupId===g.id).forEach(p=>targets.push({photo:p,key}));
       labels.push(g.label);
     }
@@ -779,11 +785,12 @@ export function Vault({ onLogout }) {
     if (!sp) return;
     setProc('Encrypting…');
     try {
-      const salt=base64ToUint8(g.salt), key=deriveKey(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const salt=base64ToUint8(g.salt);
+      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
       const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt);
       const id=genId(), path=await writeVaultFile(g, id, sealed);
       const mime = sp.mime||'image/jpeg';
-      await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:3,kdfIterations:DEFAULT_KDF_ITERATIONS,groupId:g.id,groupLabel:g.label});
+      await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
       await loadPhotos(); logEvent('shared_saved_to_vault',g.label).catch(()=>{});
       sp.onDone?.();
     } catch(e){ toast_('Save failed: '+e.message,'error'); }

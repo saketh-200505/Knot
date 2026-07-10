@@ -201,14 +201,29 @@ export function deriveKeyLegacy(passphrase, salt, iterations = DEFAULT_KDF_ITERA
 // subset of the libsodium-wrappers argument types, and `null` triggers an
 // "input type not yet implemented" native error instead of being treated as
 // "not provided".
+// The native binding rejects Uint8Array AAD ("input type not yet implemented"),
+// so we base64-encode the header bytes and pass that string. Encrypt and
+// decrypt both use the same encoding, so authentication semantics are
+// preserved — libsodium just MACs a different byte sequence than the raw
+// header, which is cryptographically fine.
+function aadToString(aad) {
+  if (aad == null) return '';
+  if (typeof aad === 'string') return aad;
+  return uint8ToBase64(aad);
+}
+
 async function aeadEncrypt(plainBytes, key, nonce, aad) {
   await ensureReady();
-  return sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plainBytes, aad, undefined, nonce, key);
+  return sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    plainBytes, aadToString(aad), undefined, nonce, key
+  );
 }
 async function aeadDecrypt(ciphertext, key, nonce, aad) {
   await ensureReady();
   try {
-    const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(undefined, ciphertext, aad, nonce, key);
+    const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+      undefined, ciphertext, aadToString(aad), nonce, key
+    );
     if (!plain) throw new Error('Wrong passphrase');
     return plain;
   } catch (e) {

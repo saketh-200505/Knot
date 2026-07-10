@@ -18,7 +18,7 @@ import {
   base64ToUint8, uint8ToBase64,
   hashStr, verifyHash,
   passphraseFingerprint,
-  DEFAULT_KDF_ITERATIONS, LEGACY_KDF_ITERATIONS,
+  DEFAULT_KDF_ITERATIONS, LEGACY_KDF_ITERATIONS, DEFAULT_ARGON2_PARAMS,
 } from '../utils/crypto';
 import {
   getPhotoIndex, addPhotoToIndex, removePhotoFromIndex,
@@ -37,7 +37,7 @@ import { GroupPicker } from '../components/GroupPicker';
 import { ChatTab }     from '../components/ChatTab';
 import { SharedTab }   from '../components/SharedTab';
 import { useChatUnread } from '../hooks/useChatUnread';
-import { COLORS, FONTS, RADIUS, SPACING, GROUP_PALETTES } from '../utils/theme';
+import { COLORS, COLOR_SCHEME, FONTS, RADIUS, SPACING, GROUP_PALETTES } from '../utils/theme';
 import { getExternalVaultDir } from '../../modules/knot-vault-dir';
 
 const { width: SW, height: SH } = Dimensions.get('window');
@@ -350,7 +350,7 @@ export function Vault({ onLogout }) {
       throw new Error(`Empty file (${asset.fileName || asset.uri || 'unknown'})`);
     }
     const bytes  = base64ToUint8(b64);
-    const sealed = group ? await sealWithKey(bytes, key, salt) : await seal(bytes, passphrase);
+    const sealed = group ? await sealWithKey(bytes, key, salt, group.kdfParams || DEFAULT_ARGON2_PARAMS) : await seal(bytes, passphrase);
     const id     = genId();
     const path   = await writeVaultFile(group, id, sealed);
     const isVid  = asset.type==='video' || (asset.mimeType||'').startsWith('video/');
@@ -381,7 +381,7 @@ export function Vault({ onLogout }) {
     const salt = group ? base64ToUint8(group.salt) : null;
     const key  = group
       ? (group.kdf === 'argon2id'
-          ? await deriveKey(passphrase, salt)
+          ? await deriveKey(passphrase, salt, group.kdfParams || DEFAULT_ARGON2_PARAMS)
           : deriveKeyLegacy(passphrase, salt, DEFAULT_KDF_ITERATIONS))
       : null;
     let count  = 0;
@@ -464,7 +464,7 @@ export function Vault({ onLogout }) {
       const g    = {
         id:genId(), label:labelNow, fingerprint:fp,
         salt:uint8ToBase64(salt), color, paletteIdx,
-        createdAt:Date.now(), kdf:'argon2id',
+        createdAt:Date.now(), kdf:'argon2id', kdfParams:DEFAULT_ARGON2_PARAMS,
       };
       await addGroup(g);
       await loadGroups();
@@ -491,14 +491,14 @@ export function Vault({ onLogout }) {
     if (tg && tg.id!=='__ungrouped') {
       if (tg.fingerprint!==fp) return {targets:[],labels:[],wrong:true};
       const salt=base64ToUint8(tg.salt);
-      const key = tg.kdf === 'argon2id' ? await deriveKey(pw,salt) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const key = tg.kdf === 'argon2id' ? await deriveKey(pw,salt,tg.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
       return { targets:photos.filter(p=>p.groupId===tg.id).map(p=>({photo:p,key})), labels:[tg.label], wrong:false };
     }
     const matching = await findGroupsByFingerprint(fp);
     const targets=[]; const labels=[];
     for (const g of matching) {
       const salt=base64ToUint8(g.salt);
-      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
       photos.filter(p=>p.groupId===g.id).forEach(p=>targets.push({photo:p,key}));
       labels.push(g.label);
     }
@@ -786,8 +786,8 @@ export function Vault({ onLogout }) {
     setProc('Encrypting…');
     try {
       const salt=base64ToUint8(g.salt);
-      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
-      const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt);
+      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt, g.kdfParams||DEFAULT_ARGON2_PARAMS);
       const id=genId(), path=await writeVaultFile(g, id, sealed);
       const mime = sp.mime||'image/jpeg';
       await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
@@ -1392,7 +1392,7 @@ const s = StyleSheet.create({
   empty:      { flex:1, alignItems:'center', justifyContent:'center', padding:SPACING.xxl },
   emptyTitle: { fontFamily:FONTS.heading, color:COLORS.textPrimary,   fontSize:20, marginBottom:6 },
   emptyDesc:  { fontFamily:FONTS.body,    color:COLORS.textSecondary, fontSize:14, textAlign:'center' },
-  overlay:    { ...StyleSheet.absoluteFillObject, backgroundColor:'rgba(240,244,255,0.93)', alignItems:'center', justifyContent:'center', gap:16, zIndex:50, elevation:50 },
+  overlay:    { ...StyleSheet.absoluteFillObject, backgroundColor:COLOR_SCHEME==='dark' ? 'rgba(28,28,30,0.93)' : 'rgba(240,244,255,0.93)', alignItems:'center', justifyContent:'center', gap:16, zIndex:50, elevation:50 },
   overlayTxt: { fontFamily:FONTS.bodyMed, color:COLORS.textSecondary, fontSize:14 },
 });
 

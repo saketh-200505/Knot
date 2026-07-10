@@ -34,10 +34,12 @@ export const LEGACY_KDF_ITERATIONS  = 15000;  // legacy PBKDF2 only
 // file, so the one-time cost of the stronger preset is negligible even when
 // encrypting many photos or a video.
 export const ARGON2_PRESETS = {
-  INTERACTIVE: { opslimit: 2, memlimit: 64  * 1024 * 1024 }, // ~64 MiB  — low-end devices
-  MODERATE:    { opslimit: 3, memlimit: 256 * 1024 * 1024 }, // ~256 MiB — default
+  INTERACTIVE: { opslimit: 2, memlimit: 64  * 1024 * 1024 }, // ~64 MiB  — low-end devices, mobile default
+  MODERATE:    { opslimit: 3, memlimit: 256 * 1024 * 1024 }, // ~256 MiB — stronger, but has been seen to
+                                                              // fail on some Android devices/emulators
+                                                              // with a generic native error at this memlimit
 };
-export const DEFAULT_ARGON2_PARAMS = ARGON2_PRESETS.MODERATE;
+export const DEFAULT_ARGON2_PARAMS = ARGON2_PRESETS.INTERACTIVE;
 
 // Refuse to honour Argon2 parameters read from a file header beyond these
 // ceilings — protects against a crafted file trying to force an OOM/hang.
@@ -87,7 +89,11 @@ console.log('[KNOT][crypto.js] v2 module loaded (XChaCha20-Poly1305 + Argon2id, 
 // salt) can silently drift out of sync with what the native side enforces.
 export async function getSaltBytes() {
   await ensureReady();
-  return sodium.crypto_pwhash_SALTBYTES || SALT_BYTES;
+  return (
+    globalThis.jsi_crypto_pwhash_SALTBYTES ||
+    sodium.crypto_pwhash_SALTBYTES ||
+    SALT_BYTES
+  );
 }
 
 // ─── SHA-256 hashing (expo-crypto) — unchanged, used for vault PIN, not files ─
@@ -109,36 +115,73 @@ export async function randomBytes(n) {
 }
 
 // ─── Argon2id key derivation (current) ───────────────────────────────────────
+// react-native-libsodium captures its constants at module-load time
+// (`export const crypto_pwhash_SALTBYTES = global.jsi_crypto_pwhash_SALTBYTES`),
+// so if the JS bundle imports the library before the native installer has run,
+// the captured constant is `undefined` for the life of the process and the
+// library's own `crypto_pwhash` guard throws "invalid salt length" for a
+// perfectly valid 16-byte salt. Read the JSI globals at CALL time instead of
+// trusting the wrapper's captured copies, and fall back to the JSI global if
+// the wrapper is broken.
 export async function deriveKey(passphrase, salt, params = DEFAULT_ARGON2_PARAMS) {
   await ensureReady();
-  const expected = sodium.crypto_pwhash_SALTBYTES || SALT_BYTES;
+  const g = globalThis;
+  const nativeSaltBytes = g.jsi_crypto_pwhash_SALTBYTES;
+  const nativeAlgId     = g.jsi_crypto_pwhash_ALG_ARGON2ID13;
+  const wrapperSaltBytes = sodium.crypto_pwhash_SALTBYTES;
+  const expected = nativeSaltBytes || wrapperSaltBytes || SALT_BYTES;
   if (!salt || salt.length !== expected) {
     throw new Error(
       `deriveKey: salt is ${salt ? salt.length : 'null'} bytes, but this platform's ` +
-      `crypto_pwhash requires exactly ${expected} bytes. Generate the salt with ` +
-      `randomBytes(await getSaltBytes()) instead of a hardcoded length.`
+      `crypto_pwhash requires exactly ${expected} bytes.`
     );
   }
-  console.log('[KNOT][crypto.js] deriveKey:', {
-    saltLen: salt.length,
-    saltCtor: salt.constructor && salt.constructor.name,
-    expectedSaltBytes: expected,
-    opslimit: params.opslimit,
-    memlimit: params.memlimit,
-    algConst: sodium.crypto_pwhash_ALG_ARGON2ID13,
-  });
+  const algConst =
+    sodium.crypto_pwhash_ALG_ARGON2ID13 != null
+      ? sodium.crypto_pwhash_ALG_ARGON2ID13
+      : nativeAlgId;
+  if (algConst == null) {
+    throw new Error(
+      'react-native-libsodium native module is not installed: ' +
+      'jsi_crypto_pwhash_ALG_ARGON2ID13 is undefined. Rebuild your custom dev ' +
+      'client (`npx expo prebuild --clean` then a fresh EAS/native build).'
+    );
+  }
+  // If the wrapper captured its SALTBYTES const as undefined, its own guard
+  // will reject any salt. Skip the wrapper and call the JSI global directly.
+  const wrapperGuardBroken = wrapperSaltBytes == null && typeof g.jsi_crypto_pwhash === 'function';
   try {
+    if (wrapperGuardBroken) {
+      const toAB = (u8) =>
+        u8.buffer.byteLength === u8.byteLength ? u8.buffer : u8.slice().buffer;
+      const passParam = typeof passphrase === 'string' ? passphrase : toAB(passphrase);
+      const result = g.jsi_crypto_pwhash(
+        KEY_BYTES,
+        passParam,
+        toAB(salt),
+        params.opslimit,
+        params.memlimit,
+        algConst
+      );
+      return new Uint8Array(result);
+    }
     return sodium.crypto_pwhash(
       KEY_BYTES,
       passphrase,
       salt,
       params.opslimit,
       params.memlimit,
-      sodium.crypto_pwhash_ALG_ARGON2ID13
+      algConst
     );
   } catch (e) {
     console.error('[KNOT][crypto.js] crypto_pwhash native call failed:', e?.message, {
-      saltLen: salt.length, expected, opslimit: params.opslimit, memlimit: params.memlimit,
+      saltLen: salt.length,
+      expected,
+      wrapperSaltBytes,
+      nativeSaltBytes,
+      wrapperGuardBroken,
+      opslimit: params.opslimit,
+      memlimit: params.memlimit,
     });
     throw e;
   }
@@ -153,18 +196,26 @@ export function deriveKeyLegacy(passphrase, salt, iterations = DEFAULT_KDF_ITERA
 }
 
 // ─── AEAD primitives (XChaCha20-Poly1305) ────────────────────────────────────
+// NOTE: secret_nonce (nsec) is unused by this construction and must always be
+// absent. Pass `undefined`, not `null` — this binding implements only a
+// subset of the libsodium-wrappers argument types, and `null` triggers an
+// "input type not yet implemented" native error instead of being treated as
+// "not provided".
 async function aeadEncrypt(plainBytes, key, nonce, aad) {
   await ensureReady();
-  return sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plainBytes, aad, null, nonce, key);
+  return sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(plainBytes, aad, undefined, nonce, key);
 }
 async function aeadDecrypt(ciphertext, key, nonce, aad) {
   await ensureReady();
   try {
-    const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(null, ciphertext, aad, nonce, key);
+    const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(undefined, ciphertext, aad, nonce, key);
     if (!plain) throw new Error('Wrong passphrase');
     return plain;
-  } catch {
-    throw new Error('Wrong passphrase');
+  } catch (e) {
+    // Don't silently relabel every failure as "wrong passphrase" -- a type
+    // error or library bug would be invisible otherwise. Surface both.
+    console.error('[KNOT][crypto.js] AEAD decrypt failed:', e?.message);
+    throw new Error(`Wrong passphrase (or decryption error: ${e?.message || e})`);
   }
 }
 

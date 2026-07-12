@@ -26,6 +26,7 @@ import {
   getGroups, addGroup, findGroupsByFingerprint, removeGroup,
   getAuditLog, clearAuditLog, logEvent,
   getBackupDirUri, setBackupDirUri,
+  isStoragePromptShown, setStoragePromptShown,
   prettyFilename,
 } from '../utils/storage';
 import { useSession }  from '../hooks/useSession';
@@ -300,12 +301,17 @@ export function Vault({ onLogout }) {
     return path;
   };
 
-  const writeVaultFile = async (group, id, sealedBytes) => {
+  const writeVaultFile = async (group, id, sealedBytes, dirUriOverride) => {
     const b64 = uint8ToBase64(sealedBytes);
     const filename = prettyFilename({ kind: 'vault', groupLabel: group?.label });
-    if (backupDirUri) {
+    // dirUriOverride is used right after ensureStorageReady() may have just
+    // picked a new folder in THIS same call — backupDirUri (React state)
+    // wouldn't be updated yet in this closure, so the caller passes the
+    // freshly-known value explicitly instead of us reading stale state.
+    const dir = dirUriOverride !== undefined ? dirUriOverride : backupDirUri;
+    if (dir) {
       try {
-        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, filename, 'application/octet-stream');
+        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, filename, 'application/octet-stream');
         await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
         return fileUri;
       } catch (e) {
@@ -344,7 +350,7 @@ export function Vault({ onLogout }) {
     }
   };
 
-  const encryptOne = async (asset, key, salt, group, passphrase) => {
+  const encryptOne = async (asset, key, salt, group, passphrase, dirUriOverride) => {
     const b64 = await readAssetBase64(asset);
     if (!b64 || b64.length === 0) {
       throw new Error(`Empty file (${asset.fileName || asset.uri || 'unknown'})`);
@@ -352,7 +358,7 @@ export function Vault({ onLogout }) {
     const bytes  = base64ToUint8(b64);
     const sealed = group ? await sealWithKey(bytes, key, salt, group.kdfParams || DEFAULT_ARGON2_PARAMS) : await seal(bytes, passphrase);
     const id     = genId();
-    const path   = await writeVaultFile(group, id, sealed);
+    const path   = await writeVaultFile(group, id, sealed, dirUriOverride);
     const isVid  = asset.type==='video' || (asset.mimeType||'').startsWith('video/');
     return {
       id, filePath:path,
@@ -373,8 +379,9 @@ export function Vault({ onLogout }) {
       toast_('No files selected — please try again', 'error');
       return;
     }
+    const freshDirUri = await ensureStorageReady();
     setProc(`Encrypting 0 of ${files.length}`);
-    if (!backupDirUri) {
+    if (!freshDirUri) {
       await ensureDir(VAULT_DIR);
       if (group) await ensureDir(`${VAULT_DIR}${group.id}/`);
     }
@@ -390,7 +397,7 @@ export function Vault({ onLogout }) {
       await new Promise(r => setTimeout(r, 0));
       try {
         setProc(`Encrypting ${count+1} of ${files.length}`);
-        const entry = await encryptOne(asset, key, salt, group, passphrase);
+        const entry = await encryptOne(asset, key, salt, group, passphrase, freshDirUri);
         await addPhotoToIndex(entry);
         count++;
       } catch(e) {
@@ -721,6 +728,46 @@ export function Vault({ onLogout }) {
     return perm.directoryUri;
   };
 
+  // Runs before every encryption. Two jobs:
+  //   1. First time ever (no folder chosen, never asked before) — ask the
+  //      user where to save, since it's easy to forget this lives in
+  //      Settings otherwise.
+  //   2. Every other time — if a folder WAS chosen, quietly verify it still
+  //      exists/is writable. If it's gone (deleted, moved, permission
+  //      revoked), clear it and ask again before continuing.
+  // Once the user has answered (either a folder or "use app storage"), we
+  // don't ask again automatically — they can always change it in Settings.
+  // Android only for now.
+  const ensureStorageReady = async () => {
+    if (Platform.OS !== 'android') return backupDirUri;
+
+    if (backupDirUri) {
+      try {
+        const testUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, `.knot_verify_${Date.now()}`, 'text/plain');
+        await FileSystem.StorageAccessFramework.deleteAsync(testUri);
+        return backupDirUri; // folder still good, nothing to ask
+      } catch {
+        await setBackupDirUri(null);
+        setBackupDirUriState(null);
+        // fall through to the prompt below
+      }
+    } else if (await isStoragePromptShown()) {
+      return null; // already asked once, user chose to skip — don't nag again
+    }
+
+    return new Promise(resolve => {
+      Alert.alert(
+        'Where should encrypted photos be saved?',
+        'Choose a visible folder on your phone (like Downloads) so your encrypted files are easy to find. You can change this anytime in Settings.',
+        [
+          { text: 'Use App Storage', style: 'cancel', onPress: async () => { await setStoragePromptShown(); resolve(null); } },
+          { text: 'Choose Folder', onPress: async () => { const dir = await chooseBackupFolder(); await setStoragePromptShown(); resolve(dir); } },
+        ],
+        { cancelable: false }
+      );
+    });
+  };
+
   // Does a real test write + delete against the saved folder so the user
   // finds out right away if the SAF grant has gone stale (folder deleted,
   // SD card removed, permission revoked in Android settings) instead of
@@ -783,12 +830,13 @@ export function Vault({ onLogout }) {
   // ── SAVE SHARED TO VAULT ──────────────────────────────────────────────────
   const saveToVault = async (sp, pw, g) => {
     if (!sp) return;
+    const freshDirUri = await ensureStorageReady();
     setProc('Encrypting…');
     try {
       const salt=base64ToUint8(g.salt);
       const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
       const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt, g.kdfParams||DEFAULT_ARGON2_PARAMS);
-      const id=genId(), path=await writeVaultFile(g, id, sealed);
+      const id=genId(), path=await writeVaultFile(g, id, sealed, freshDirUri);
       const mime = sp.mime||'image/jpeg';
       await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
       await loadPhotos(); logEvent('shared_saved_to_vault',g.label).catch(()=>{});
@@ -1162,13 +1210,6 @@ export function Vault({ onLogout }) {
 
       <View style={s.card}>
         <Text style={s.cardTitle}>Vault Storage</Text>
-        <Text style={s.cardDesc}>{backupDirUri ? 'New encrypted files are saved directly to:' : 'Encrypted files are stored at:'}</Text>
-        <Text style={{fontFamily:FONTS.mono,color:COLORS.textSecondary,fontSize:11,marginTop:4}} numberOfLines={2}>
-          {backupDirUri ? decodeURIComponent(backupDirUri.split('tree/')[1]||backupDirUri) : VAULT_DIR}
-        </Text>
-        {!!backupDirUri && (
-          <Text style={{fontFamily:FONTS.body,color:COLORS.textMuted,fontSize:11,marginTop:4}}>Older photos encrypted before you chose this folder remain at: {VAULT_DIR}</Text>
-        )}
         <Text style={{fontFamily:FONTS.body,color:COLORS.textMuted,fontSize:11,marginTop:4}}>Use the CLI tool (cli/knot.js) to decrypt files without this app.</Text>
       </View>
 

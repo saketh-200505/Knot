@@ -12,6 +12,7 @@ const KEYS = {
   IMPORTED_INDEX:    'av_imported_index',
   BACKUP_DIR_URI:    'av_backup_dir_uri',
   SHARED_SUBDIR_URI: 'av_shared_subdir_uri',
+  STORAGE_PROMPT_SHOWN: 'av_storage_prompt_shown',
 };
 
 export { KEYS };
@@ -205,4 +206,14 @@ export async function setSharedSubdirUri(uri) {
 }
 export async function clearSharedSubdirUri() {
   return storage.remove(KEYS.SHARED_SUBDIR_URI);
+}
+
+// Whether we've already asked the user once about choosing a visible backup
+// folder (on first encrypt, or after a previously-chosen folder went stale).
+// Prevents re-nagging every single encryption once they've made a choice.
+export async function isStoragePromptShown() {
+  return (await storage.get(KEYS.STORAGE_PROMPT_SHOWN)) === 'true';
+}
+export async function setStoragePromptShown() {
+  return storage.set(KEYS.STORAGE_PROMPT_SHOWN, 'true');
 }

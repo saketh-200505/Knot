@@ -25,9 +25,10 @@
  *
  * Encrypting with this tool always writes the current v2 format.
  *
- * Dependencies: `libsodium-wrappers` (npm install libsodium-wrappers) for
- * Argon2id + XChaCha20-Poly1305. Node's built-in `crypto` is still used for
- * the legacy v1 AES-CTR/PBKDF2 path.
+ * Dependencies: `libsodium-wrappers-sumo` (npm install libsodium-wrappers-sumo)
+ * for Argon2id + XChaCha20-Poly1305. The plain `libsodium-wrappers` package
+ * does NOT include crypto_pwhash (Argon2id) — only the sumo build does.
+ * Node's built-in `crypto` is still used for the legacy v1 AES-CTR/PBKDF2 path.
  *
  * Usage:
  *   node knot.js decrypt <input.dat> <output.jpg> "<passphrase>" [--iter 8000]
@@ -36,7 +37,7 @@
 
 const fs = require('fs');
 const crypto = require('crypto');
-const sodium = require('libsodium-wrappers');
+const sodium = require('libsodium-wrappers-sumo');
 
 const MAGIC_V1 = Buffer.from([0x4b, 0x4e, 0x54, 0x31]); // "KNT1"
 const MAGIC_V2 = Buffer.from([0x4b, 0x4e, 0x54, 0x32]); // "KNT2"
@@ -95,9 +96,18 @@ async function decryptV2(data, passphrase) {
     32, passphrase, salt, opslimit, memlimit, sodium.crypto_pwhash_ALG_ARGON2ID13
   );
 
+  // AAD must match crypto.js exactly. The app's native binding
+  // (react-native-libsodium) rejects raw-byte AAD, so crypto.js base64-encodes
+  // the header and MACs the base64 STRING, not the raw header bytes. This CLI
+  // uses libsodium-wrappers, which would happily accept the raw bytes — but
+  // doing so would compute a different tag and fail to authenticate files
+  // produced by the app (and vice versa). Must mirror the encoding, not just
+  // the wire format.
+  const aad = header.toString('base64');
+
   try {
     const plain = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
-      null, ciphertext, header, nonce, key
+      null, ciphertext, aad, nonce, key
     );
     return Buffer.from(plain);
   } catch {
@@ -121,8 +131,11 @@ async function encryptV2(plain, passphrase, strength) {
   Buffer.from(salt).copy(header, 12);
   Buffer.from(nonce).copy(header, 12 + SALT_BYTES);
 
+  // See decryptV2: AAD must be the base64-encoded header STRING, not raw
+  // bytes, to match crypto.js and stay interoperable with the app.
+  const aad = header.toString('base64');
   const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
-    plain, header, null, nonce, key
+    plain, aad, null, nonce, key
   );
   return Buffer.concat([header, Buffer.from(ciphertext)]);
 }

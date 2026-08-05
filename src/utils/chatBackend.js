@@ -60,3 +60,34 @@ export async function fbPatch(path, data) {
 export function roomPath(a, b) {
   return 'chats/' + [a, b].sort().join('__');
 }
+
+// ─── Message retention (client-side "cron") ────────────────────────────────
+// There's no server here to run a real cron job, so instead: every time a
+// room is polled, if it's been >24h since we last checked, sweep any
+// message older than MESSAGE_TTL_MS out of Firebase. This uses the room
+// data ALREADY downloaded by the poll — no extra GET — and only issues a
+// PATCH (cheap) for the stale ids, if any exist. Both sides of a chat do
+// this independently, so the room stays trimmed regardless of which
+// device happens to be open when the sweep runs.
+//
+// Note: this only trims the SERVER copy. Each device's own local message
+// history (persisted separately in AsyncStorage) is untouched, so nothing
+// disappears from your chat view — this purely keeps future room downloads
+// small by not re-fetching your entire history every poll.
+export const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export async function pruneOldMessages(path, roomData) {
+  if (!roomData || typeof roomData !== 'object') return { pruned: 0 };
+  const cutoff = Date.now() - MESSAGE_TTL_MS;
+  const toDelete = {};
+  let count = 0;
+  for (const [id, msg] of Object.entries(roomData)) {
+    if (msg && typeof msg === 'object' && typeof msg.ts === 'number' && msg.ts < cutoff) {
+      toDelete[id] = null; // Firebase: setting a key to null deletes it
+      count++;
+    }
+  }
+  if (count === 0) return { pruned: 0 };
+  const res = await fbPatch(path, toDelete); // one multi-location delete, not N requests
+  return { pruned: res.ok ? count : 0, error: res.ok ? null : res.error };
+}

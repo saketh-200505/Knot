@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, FlatList,
-  Image, ActivityIndicator, Alert, Dimensions,
+  Image, ActivityIndicator, Dimensions,
   Animated, PanResponder,
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
@@ -17,6 +17,7 @@ import {
   prettyFilename,
 } from '../utils/storage';
 import { PassSheet } from './PassSheet';
+import { showAlert } from './ThemedAlert';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 
 const { width: SW, height: SH } = Dimensions.get('window');
@@ -127,6 +128,8 @@ export function SharedTab({ onSaveToVault, showToast }) {
   const [decrypted, setDecrypted]   = useState({});
   const [unlockTarget, setUnlock]   = useState(null);
   const [viewItem, setViewItem]     = useState(null);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
 
   useEffect(() => { load(); }, []);
   const load = async () => setItems(await getImportedIndex());
@@ -225,18 +228,65 @@ export function SharedTab({ onSaveToVault, showToast }) {
     const dec = decrypted[item.id];
     if (!dec) return;
     setViewItem(null);
-    onSaveToVault?.(dec.plainB64, dec.mime, item.name, async () => {
-      await FileSystem.deleteAsync(item.filePath, { idempotent: true });
-      if (dec.mime?.startsWith('video/')) await FileSystem.deleteAsync(dec.uri, { idempotent: true }).catch(() => {});
-      await removeImportedFromIndex(item.id);
-      setDecrypted(prev => { const n = { ...prev }; delete n[item.id]; return n; });
+    saveItemsToVault([item]);
+  };
+
+  // Shared cleanup + save path for both the single-item viewer save and the
+  // multi-select batch save below — same logic, just looped over N items.
+  const saveItemsToVault = (targetItems) => {
+    const forSave = targetItems.map(item => {
+      const dec = decrypted[item.id];
+      return { id: item.id, plainB64: dec.plainB64, mime: dec.mime, name: item.name };
+    }).filter(x => x.plainB64);
+    if (!forSave.length) return;
+
+    onSaveToVault?.(forSave, async () => {
+      for (const item of targetItems) {
+        const dec = decrypted[item.id];
+        await FileSystem.deleteAsync(item.filePath, { idempotent: true });
+        if (dec?.mime?.startsWith('video/')) await FileSystem.deleteAsync(dec.uri, { idempotent: true }).catch(() => {});
+        await removeImportedFromIndex(item.id);
+      }
+      setDecrypted(prev => {
+        const n = { ...prev };
+        for (const item of targetItems) delete n[item.id];
+        return n;
+      });
       await load();
-      showToast?.('Moved into your vault', 'success');
+      showToast?.(
+        targetItems.length > 1 ? `${targetItems.length} moved into your vault` : 'Moved into your vault',
+        'success'
+      );
     });
   };
 
+  const toggleSelect = (id) => {
+    setSelectedIds(prev => {
+      const n = new Set(prev);
+      if (n.has(id)) n.delete(id); else n.add(id);
+      if (n.size === 0) setSelectMode(false);
+      return n;
+    });
+  };
+
+  const startSelect = (item) => {
+    setSelectMode(true);
+    setSelectedIds(new Set([item.id]));
+  };
+
+  const cancelSelect = () => {
+    setSelectMode(false);
+    setSelectedIds(new Set());
+  };
+
+  const saveSelectedToVault = () => {
+    const targetItems = items.filter(i => selectedIds.has(i.id) && decrypted[i.id]);
+    cancelSelect();
+    saveItemsToVault(targetItems);
+  };
+
   const removeItem = (item) => {
-    Alert.alert('Remove', `Remove "${item.name}" from Shared?`, [
+    showAlert('Remove', `Remove "${item.name}" from Shared?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Remove', style: 'destructive', onPress: async () => {
         const dec = decrypted[item.id];
@@ -253,15 +303,42 @@ export function SharedTab({ onSaveToVault, showToast }) {
     const dec = decrypted[item.id];
     const isLoading = loadingId === item.id;
     const isVideo = dec?.mime?.startsWith('video/');
-    return (
-      <TouchableOpacity
-        style={s.tile}
-        onPress={() => dec ? setViewItem(item) : setUnlock(item)}
-        onLongPress={() => Alert.alert(item.name, 'What would you like to do?', [
+    const isSelected = selectedIds.has(item.id);
+
+    const onPress = () => {
+      if (selectMode) {
+        if (dec) toggleSelect(item.id); // locked items can't be selected — nothing to save yet
+        return;
+      }
+      dec ? setViewItem(item) : setUnlock(item);
+    };
+
+    const onLongPress = () => {
+      if (selectMode) return; // already selecting — plain tap extends the selection
+      if (dec) {
+        // Unlocked already — offer Save to Vault right here, or start a
+        // multi-select so several pics can be moved into a group at once.
+        showAlert(item.name, 'What would you like to do?', [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Save to Vault', onPress: () => doSaveToVault(item) },
+          { text: 'Select Multiple…', onPress: () => startSelect(item) },
+          { text: 'Share Encrypted', onPress: () => shareEncrypted(item) },
+          { text: 'Remove', style: 'destructive', onPress: () => removeItem(item) },
+        ]);
+      } else {
+        showAlert(item.name, 'What would you like to do?', [
           { text: 'Cancel', style: 'cancel' },
           { text: 'Share Encrypted', onPress: () => shareEncrypted(item) },
           { text: 'Remove', style: 'destructive', onPress: () => removeItem(item) },
-        ])}
+        ]);
+      }
+    };
+
+    return (
+      <TouchableOpacity
+        style={s.tile}
+        onPress={onPress}
+        onLongPress={onLongPress}
         activeOpacity={0.85}
       >
         {isLoading ? (
@@ -272,7 +349,12 @@ export function SharedTab({ onSaveToVault, showToast }) {
               ? <View style={s.tileImg}><Text style={{fontSize:34}}>🎬</Text></View>
               : <Image source={{uri:dec.uri}} style={s.tileImg} resizeMode="cover"/>
             }
-            <View style={s.tileOpen}><Text style={s.tileOpenTxt}>✓</Text></View>
+            {selectMode
+              ? <View style={[s.tileOpen, isSelected && s.tileOpenSelected]}>
+                  {isSelected && <Text style={s.tileOpenTxt}>✓</Text>}
+                </View>
+              : <View style={s.tileOpen}><Text style={s.tileOpenTxt}>✓</Text></View>
+            }
           </>
         ) : (
           <View style={s.tileLock}>
@@ -290,10 +372,31 @@ export function SharedTab({ onSaveToVault, showToast }) {
     <View style={{ flex: 1, backgroundColor: COLORS.bg }}>
       {/* Toolbar */}
       <View style={s.toolbar}>
-        <Text style={s.toolTitle}>{items.length} file{items.length !== 1 ? 's' : ''}</Text>
-        <TouchableOpacity style={s.toolBtn} onPress={importFile} activeOpacity={0.8}>
-          <Text style={s.toolBtnTxt}>+ Import File</Text>
-        </TouchableOpacity>
+        {selectMode ? (
+          <>
+            <Text style={s.toolTitle}>{selectedIds.size} selected</Text>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TouchableOpacity style={s.toolBtnGhost} onPress={cancelSelect} activeOpacity={0.8}>
+                <Text style={s.toolBtnGhostTxt}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[s.toolBtn, !selectedIds.size && { opacity: 0.5 }]}
+                onPress={saveSelectedToVault}
+                disabled={!selectedIds.size}
+                activeOpacity={0.8}
+              >
+                <Text style={s.toolBtnTxt}>Save to Vault</Text>
+              </TouchableOpacity>
+            </View>
+          </>
+        ) : (
+          <>
+            <Text style={s.toolTitle}>{items.length} file{items.length !== 1 ? 's' : ''}</Text>
+            <TouchableOpacity style={s.toolBtn} onPress={importFile} activeOpacity={0.8}>
+              <Text style={s.toolBtnTxt}>+ Import File</Text>
+            </TouchableOpacity>
+          </>
+        )}
       </View>
 
       {items.length === 0 ? (
@@ -355,6 +458,8 @@ const s = StyleSheet.create({
   toolTitle:   { fontFamily:FONTS.body, color:COLORS.textSecondary, fontSize:13 },
   toolBtn:     { borderWidth:1.5, borderColor:COLORS.indigo, borderRadius:RADIUS.md, paddingHorizontal:14, paddingVertical:7, backgroundColor:COLORS.indigo+'14' },
   toolBtnTxt:  { fontFamily:FONTS.bodyMed, color:COLORS.indigo, fontSize:13 },
+  toolBtnGhost:{ borderWidth:1.5, borderColor:COLORS.border, borderRadius:RADIUS.md, paddingHorizontal:14, paddingVertical:7 },
+  toolBtnGhostTxt: { fontFamily:FONTS.bodyMed, color:COLORS.textSecondary, fontSize:13 },
   grid:        { padding:SPACING.md, paddingBottom:100 },
   row:         { gap:4, marginBottom:4 },
   tile:        { width:THUMB, height:THUMB, borderRadius:RADIUS.md, overflow:'hidden', backgroundColor:COLORS.surface2 },
@@ -362,6 +467,7 @@ const s = StyleSheet.create({
   tileLock:   { flex:1, alignItems:'center', justifyContent:'center', gap:6, padding:6 },
   tileLockTxt:{ fontFamily:FONTS.body, color:COLORS.textMuted, fontSize:10, textAlign:'center' },
   tileOpen:   { position:'absolute', top:6, right:6, width:20, height:20, borderRadius:10, backgroundColor:COLORS.indigo, alignItems:'center', justifyContent:'center' },
+  tileOpenSelected: { backgroundColor:COLORS.indigo, borderWidth:2, borderColor:'#fff' },
   tileOpenTxt:{ color:'#fff', fontSize:11, fontFamily:FONTS.bodyMed },
   empty:       { flex:1, alignItems:'center', justifyContent:'center', padding:SPACING.xxl },
   emptyTitle:  { fontFamily:FONTS.heading, color:COLORS.textPrimary, fontSize:20, marginBottom:8 },

@@ -17,7 +17,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   View, Text, TextInput, TouchableOpacity, FlatList,
   StyleSheet, KeyboardAvoidingView, Platform, ActivityIndicator,
-  Alert, Pressable, Animated, PanResponder, BackHandler,
+  Alert, Pressable, Animated, PanResponder, BackHandler, AppState,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as ExpoC from 'expo-crypto';
@@ -25,8 +25,9 @@ import * as aesjs from 'aes-js';
 import { sha256 } from '@noble/hashes/sha256';
 import Constants from 'expo-constants';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
-import { fbGet, fbSet, fbPatch, roomPath } from '../utils/chatBackend';
-import { markContactRead } from '../hooks/useChatUnread';
+import { fbGet, fbSet, fbPatch, roomPath, pruneOldMessages } from '../utils/chatBackend';
+import { markContactRead, setActiveChatContact } from '../hooks/useChatUnread';
+import { showAlert } from './ThemedAlert';
 
 const POLL_INTERVAL = 2000; // ms — poll Firebase every 2 seconds
 
@@ -220,6 +221,8 @@ const KEY_MSG      = 'knot_chat_msgs';
 const KEY_NOTIF_ON = 'knot_chat_notif_default'; // 'on' | 'off'
 const notifKeyFor  = (pubHex) => `knot_chat_notif:${pubHex}`;
 const HAS_NOTIF_LIB = !!Notifications;
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // check once a day per room, not every poll
+const pruneKeyFor = (path) => `knot_chat_pruned_at:${path}`;
 
 async function isNotifEnabled(contactPubHex) {
   const v = await AsyncStorage.getItem(notifKeyFor(contactPubHex));
@@ -230,6 +233,26 @@ async function isNotifEnabled(contactPubHex) {
 }
 async function setNotifEnabled(contactPubHex, on) {
   await AsyncStorage.setItem(notifKeyFor(contactPubHex), on ? 'on' : 'off');
+}
+
+// ─── Per-user notification prefs (published so the OTHER side can see them) ──
+// The bell toggle means "notify ME about messages FROM this contact." Since
+// there's no backend/auth, the only way the sender can know whether the
+// recipient wants a push is if the recipient publishes that preference
+// somewhere both can reach — so we mirror it to Firebase under the
+// recipient's own pubHex, keyed by which contact it's about.
+function notifPrefPath(ownerPubHex, aboutPubHex) {
+  return `notifPrefs/${ownerPubHex}/${aboutPubHex}`;
+}
+async function publishNotifPref(myPubHex, contactPubHex, on) {
+  fbSet(notifPrefPath(myPubHex, contactPubHex), on).catch(() => {});
+}
+// Called by the SENDER before pushing: does the recipient want notifications
+// about messages from me? Defaults to true (on) if nothing's been published.
+async function recipientWantsNotif(recipientPubHex, senderPubHex) {
+  const res = await fbGet(notifPrefPath(recipientPubHex, senderPubHex));
+  if (res.ok && res.data === false) return false;
+  return true;
 }
 
 // ─── Utils ────────────────────────────────────────────────────────────────────
@@ -301,17 +324,17 @@ export function ChatTab({ unreadPerContact = {}, onChatVisibilityChange } = {}) 
   const handleAdd = useCallback(async (name, pubHex) => {
     const p = pubHex.replace(/\s+/g, '').toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(p)) {
-      Alert.alert(
+      showAlert(
         'Invalid key',
         'A Knot public key is 64 hex characters. Ask the other person to open Messages → "My key" and copy the whole string.'
       );
       return;
     }
     if (identity && p === identity.pubHex) {
-      Alert.alert('That\'s your own key', 'You can\'t add yourself as a contact.'); return;
+      showAlert('That\'s your own key', 'You can\'t add yourself as a contact.'); return;
     }
     if (contacts.find(c => c.pubHex === p)) {
-      Alert.alert('Already added', 'This contact is already in your list.'); return;
+      showAlert('Already added', 'This contact is already in your list.'); return;
     }
     await saveContacts([...contacts, { id: genId(), name, pubHex: p }]);
   }, [contacts, saveContacts, identity]);
@@ -352,7 +375,7 @@ function SetupScreen({ onDone }) {
     if (!alias.trim()) return;
     setBusy(true);
     try { await onDone(alias.trim()); }
-    catch (e) { Alert.alert('Error', e.message); setBusy(false); }
+    catch (e) { showAlert('Error', e.message); setBusy(false); }
   };
 
   return (
@@ -417,10 +440,10 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete, unreadPerCon
 
   const add = async () => {
     if (!name.trim()) {
-      Alert.alert('Missing name', 'Give this contact a name.'); return;
+      showAlert('Missing name', 'Give this contact a name.'); return;
     }
     if (!pub.trim()) {
-      Alert.alert('Missing key', 'Paste the other person\'s public key.'); return;
+      showAlert('Missing key', 'Paste the other person\'s public key.'); return;
     }
     setBusy(true);
     await onAdd(name.trim(), pub);
@@ -428,7 +451,7 @@ function RoomsScreen({ identity, contacts, onOpen, onAdd, onDelete, unreadPerCon
   };
 
   const confirmDelete = c =>
-    Alert.alert('Remove', `Remove "${c.name}"?`, [
+    showAlert('Remove', `Remove "${c.name}"?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Remove', style: 'destructive', onPress: () => onDelete(c.id) },
     ]);
@@ -612,6 +635,7 @@ function ChatScreen({ identity, contact, onBack }) {
       } catch {}
       const on = await isNotifEnabled(contact.pubHex);
       setNotifOn(on);
+      publishNotifPref(identity.pubHex, contact.pubHex, on); // sync so this contact's device knows
       // Opening the thread clears the unread count for this contact.
       markContactRead(contact.pubHex).catch(() => {});
     })();
@@ -638,6 +662,16 @@ function ChatScreen({ identity, contact, onBack }) {
     if (!res.ok) return;
     const data = res.data;
     if (!data || typeof data !== 'object') return;
+
+    // Client-side "cron": once a day, sweep messages older than 7 days out
+    // of Firebase using the data we just downloaded anyway — no extra GET.
+    (async () => {
+      const key = pruneKeyFor(path);
+      const lastPrune = Number(await AsyncStorage.getItem(key)) || 0;
+      if (Date.now() - lastPrune < PRUNE_INTERVAL_MS) return;
+      await AsyncStorage.setItem(key, String(Date.now()));
+      pruneOldMessages(path, data).catch(() => {});
+    })();
 
     const newMsgs = [];
     const receiptUpdates = []; // { id, readAt } — messages of ours that got read
@@ -758,14 +792,35 @@ function ChatScreen({ identity, contact, onBack }) {
     }
   }, [path, identity.pubHex, contact.pubHex, pollPresence, persistMessages]);
 
-  // Start polling on mount, stop on unmount
+  // Start polling on mount, stop on unmount. Also pause while the app is
+  // backgrounded (screen off / user switched apps) — nothing needs to sync
+  // while this screen isn't visible, and resuming does an immediate fetch
+  // so you're instantly caught up when you come back.
   useEffect(() => {
-    poll(); // immediate first fetch
-    pollTimer.current = setInterval(poll, POLL_INTERVAL);
-    return () => {
+    setActiveChatContact(contact.pubHex); // tell useChatUnread to skip this room
+
+    function start() {
+      stop();
+      poll(); // immediate fetch on (re)start
+      pollTimer.current = setInterval(poll, POLL_INTERVAL);
+    }
+    function stop() {
       if (pollTimer.current) clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+
+    start();
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') start();
+      else stop();
+    });
+
+    return () => {
+      stop();
+      sub.remove();
+      setActiveChatContact(null);
     };
-  }, [poll]);
+  }, [poll, contact.pubHex]);
 
   // Note: with an inverted list, staying pinned to the latest message at
   // offset 0 is native FlatList behavior — no manual scroll-on-update effect
@@ -777,7 +832,8 @@ function ChatScreen({ identity, contact, onBack }) {
     const next = !notifOn;
     setNotifOn(next);
     await setNotifEnabled(contact.pubHex, next);
-  }, [notifOn, contact.pubHex]);
+    publishNotifPref(identity.pubHex, contact.pubHex, next); // let their device see the change
+  }, [notifOn, contact.pubHex, identity.pubHex]);
 
   // Send message (or commit an in-flight edit)
   const send = useCallback(async () => {
@@ -799,7 +855,7 @@ function ChatScreen({ identity, contact, onBack }) {
       });
       const res = await fbPatch(`${path}/${target.id}`, { ct, editedAt });
       if (!res.ok) {
-        Alert.alert('Edit failed', res.error || 'Please try again.');
+        showAlert('Edit failed', res.error || 'Please try again.');
       } else {
         // Track our own edit so the poll's reconciler doesn't re-echo it as a
         // remote edit and clobber the state we just set.
@@ -854,16 +910,19 @@ function ChatScreen({ identity, contact, onBack }) {
       return next;
     });
     if (!res.ok) {
-      Alert.alert(
+      showAlert(
         'Message not delivered',
         `Failed to reach the server: ${res.error || 'unknown error'}. Check your internet or the Firebase configuration.`
       );
-    } else if (notifOn) {
-      // Fire disguised push to the recipient (no-op if no token registered)
-      sendPushTo(contact.pubHex).catch(() => {});
+    } else {
+      // Fire disguised push to the recipient, but only if THEY still want
+      // notifications from me — not gated on my own bell toggle for them.
+      recipientWantsNotif(contact.pubHex, identity.pubHex).then((wants) => {
+        if (wants) sendPushTo(contact.pubHex).catch(() => {});
+      });
     }
     setSending(false);
-  }, [input, sending, identity, path, replyingTo, editingMsg, notifOn, contact.pubHex, persistMessages]);
+  }, [input, sending, identity, path, replyingTo, editingMsg, contact.pubHex, persistMessages]);
 
   // Long-press action sheet: reply / edit (own only) / delete
   const openMessageActions = useCallback((m) => {
@@ -880,7 +939,7 @@ function ChatScreen({ identity, contact, onBack }) {
         text: 'Delete',
         style: 'destructive',
         onPress: () => {
-          Alert.alert('Delete message?', 'This removes it for both of you.', [
+          showAlert('Delete message?', 'This removes it for both of you.', [
             { text: 'Cancel', style: 'cancel' },
             { text: 'Delete', style: 'destructive', onPress: async () => {
               setMessages(prev => {
@@ -893,14 +952,14 @@ function ChatScreen({ identity, contact, onBack }) {
               // Soft-delete via PATCH so the peer's poll can pick up the flag;
               // hard DELETE would just make the id vanish silently on their side.
               const res = await fbPatch(`${path}/${m.id}`, { deleted: true });
-              if (!res.ok) Alert.alert('Delete failed', res.error || 'Please try again.');
+              if (!res.ok) showAlert('Delete failed', res.error || 'Please try again.');
             }},
           ]);
         },
       });
     }
     actions.push({ text: 'Cancel', style: 'cancel' });
-    Alert.alert('Message', undefined, actions);
+    showAlert('Message', undefined, actions);
   }, [path, persistMessages]);
 
   const cancelEdit = useCallback(() => {

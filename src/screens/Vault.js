@@ -5,7 +5,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   View, Text, ScrollView, TouchableOpacity, StyleSheet,
   Image, FlatList, Dimensions, Animated, Platform, PanResponder,
-  Alert, ActivityIndicator, TextInput, InteractionManager, BackHandler,
+  ActivityIndicator, TextInput, InteractionManager, BackHandler,
 } from 'react-native';
 import * as ImagePicker  from 'expo-image-picker';
 import * as FileSystem   from 'expo-file-system';
@@ -35,6 +35,7 @@ import { PassSheet }   from '../components/PassSheet';
 import { Sheet }       from '../components/Sheet';
 import { Toast }       from '../components/Toast';
 import { GroupPicker } from '../components/GroupPicker';
+import { showAlert }   from '../components/ThemedAlert';
 import { ChatTab }     from '../components/ChatTab';
 import { SharedTab }   from '../components/SharedTab';
 import { useChatUnread } from '../hooks/useChatUnread';
@@ -577,7 +578,7 @@ export function Vault({ onLogout }) {
 
   const deleteGroup = (g) => {
     const gPhotos = photos.filter(p => p.groupId === g.id);
-    Alert.alert(
+    showAlert(
       `Delete "${g.label}"?`,
       gPhotos.length > 0
         ? `This group has ${gPhotos.length} encrypted photo${gPhotos.length !== 1 ? 's' : ''}.\n\nDelete the group record only (photos stay on disk, encrypted), or delete everything including the encrypted files?`
@@ -612,7 +613,7 @@ export function Vault({ onLogout }) {
   };
 
   const deleteSelected = () => {
-    Alert.alert('Remove',`Remove ${selected.size} item${selected.size!==1?'s':''}? Cannot be undone.`,[
+    showAlert('Remove',`Remove ${selected.size} item${selected.size!==1?'s':''}? Cannot be undone.`,[
       {text:'Cancel',style:'cancel'},
       {text:'Remove',style:'destructive', onPress:async()=>{
         for (const id of selected) {
@@ -706,7 +707,7 @@ export function Vault({ onLogout }) {
   };
 
   const promptShare = (id) => {
-    Alert.alert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual photo?', [
+    showAlert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual photo?', [
       {text:'Cancel', style:'cancel'},
       {text:'Encrypted file', onPress:()=>shareEnc(id)},
       {text:'Actual photo', onPress:()=>shareDecrypted(id)},
@@ -756,7 +757,7 @@ export function Vault({ onLogout }) {
     }
 
     return new Promise(resolve => {
-      Alert.alert(
+      showAlert(
         'Where should encrypted photos be saved?',
         'Choose a visible folder on your phone (like Downloads) so your encrypted files are easy to find. You can change this anytime in Settings.',
         [
@@ -829,20 +830,33 @@ export function Vault({ onLogout }) {
 
   // ── SAVE SHARED TO VAULT ──────────────────────────────────────────────────
   const saveToVault = async (sp, pw, g) => {
-    if (!sp) return;
+    if (!sp?.items?.length) return;
     const freshDirUri = await ensureStorageReady();
-    setProc('Encrypting…');
-    try {
-      const salt=base64ToUint8(g.salt);
-      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
-      const sealed = await sealWithKey(base64ToUint8(sp.plainB64), key, salt, g.kdfParams||DEFAULT_ARGON2_PARAMS);
-      const id=genId(), path=await writeVaultFile(g, id, sealed, freshDirUri);
-      const mime = sp.mime||'image/jpeg';
-      await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:sp.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
-      await loadPhotos(); logEvent('shared_saved_to_vault',g.label).catch(()=>{});
+    const salt = base64ToUint8(g.salt);
+    const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
+    let count = 0, firstErr = null;
+    for (const item of sp.items) {
+      await new Promise(r => setTimeout(r, 0));
+      setProc(sp.items.length > 1 ? `Encrypting ${count+1} of ${sp.items.length}` : 'Encrypting…');
+      try {
+        const sealed = await sealWithKey(base64ToUint8(item.plainB64), key, salt, g.kdfParams||DEFAULT_ARGON2_PARAMS);
+        const id=genId(), path=await writeVaultFile(g, id, sealed, freshDirUri);
+        const mime = item.mime||'image/jpeg';
+        await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:item.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
+        count++;
+      } catch(e) {
+        console.warn('[KNOT] Save-to-vault err:', e?.message, e?.stack);
+        if (!firstErr) firstErr = e?.message || String(e);
+      }
+    }
+    await loadPhotos();
+    logEvent('shared_saved_to_vault', `${count}/${sp.items.length} -> ${g.label}`).catch(() => {});
+    setProc('');
+    if (count > 0) {
       sp.onDone?.();
-    } catch(e){ toast_('Save failed: '+e.message,'error'); }
-    finally { setProc(''); }
+    } else {
+      toast_('Save failed: ' + (firstErr || 'unknown error'), 'error');
+    }
   };
 
   // ── SETTINGS ──────────────────────────────────────────────────────────────
@@ -1246,7 +1260,7 @@ export function Vault({ onLogout }) {
       } catch(e) { toast_('Share failed: '+e.message,'error'); }
     };
     const choosShare=()=>{
-      Alert.alert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual photo?', [
+      showAlert('Share', 'Share the encrypted file (only opens with the passphrase) or the actual photo?', [
         {text:'Cancel', style:'cancel'},
         {text:'Encrypted file', onPress:doShareEnc},
         {text:'Actual photo', onPress:doShare},
@@ -1316,7 +1330,7 @@ export function Vault({ onLogout }) {
           scroll position. Calling them inline keeps the ScrollView/FlatList
           instances stable, so scroll position sticks. */}
       {tab===0 && GalleryTab()}
-      {tab===1 && <SharedTab showToast={toast_} onSaveToVault={(b64,mime,name,done)=>setSavePending({plainB64:b64,mime,name,onDone:done})}/>}
+      {tab===1 && <SharedTab showToast={toast_} onSaveToVault={(items,done)=>setSavePending({items,onDone:done})}/>}
       {tab===2 && (
         <ChatTab
           showToast={toast_}
@@ -1334,7 +1348,7 @@ export function Vault({ onLogout }) {
         remaining={session.remaining}
         onExport={()=>{setExportTarget(viewVideo?.photo.id);setViewVideo(null);setShowExport(true);}}
         onShare={(vid)=>{
-          Alert.alert('Share','Share the encrypted file or the actual video?',[
+          showAlert('Share','Share the encrypted file or the actual video?',[
             {text:'Cancel',style:'cancel'},
             {text:'Encrypted file',onPress:()=>{Sharing.isAvailableAsync().then(ok=>ok&&Sharing.shareAsync(vid.photo.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'})).then(()=>logEvent('share_encrypted',vid.photo.name).catch(()=>{})).catch(e=>toast_('Share failed: '+e.message,'error'));}},
             {text:'Actual video',onPress:()=>{Sharing.isAvailableAsync().then(ok=>ok&&Sharing.shareAsync(vid.uri,{mimeType:vid.photo.mimeType||'video/mp4'})).then(()=>logEvent('share_decrypted',vid.photo.name).catch(()=>{})).catch(e=>toast_('Share failed: '+e.message,'error'));}}
@@ -1382,7 +1396,7 @@ export function Vault({ onLogout }) {
       <PassSheet visible={!!showExistingPass} onClose={()=>{setShowExistingPass(null);setPending([]);}}
         onConfirm={confirmExistingPass} title={`Add to "${showExistingPass?.label}"`} subtitle="Confirm group passphrase" confirmLabel="Encrypt & Add"/>
 
-      <GroupPicker visible={!!savePending&&!saveGroup} onClose={()=>setSavePending(null)} groups={groups} count={1}
+      <GroupPicker visible={!!savePending&&!saveGroup} onClose={()=>setSavePending(null)} groups={groups} count={savePending?.items?.length||1}
         onPick={g=>setSaveGroup(g)} onCreateNew={()=>{setNewLabel('');setShowNewLabel(true);setSaveViaNew(true);}}/>
       <PassSheet visible={!!saveGroup} onClose={()=>setSaveGroup(null)}
         onConfirm={async pw=>{

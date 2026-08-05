@@ -10,6 +10,7 @@ import { SnakeGame } from './src/screens/SnakeGame';
 import { VaultLogin } from './src/screens/VaultLogin';
 import { Vault } from './src/screens/Vault';
 import { SSBlock } from './src/components/SSBlock';
+import { AlertHost } from './src/components/ThemedAlert';
 import { COLORS, COLOR_SCHEME } from './src/utils/theme';
 
 const ROUTES = { LOADING:'loading', ONBOARDING:'onboarding', GAME:'game', LOGIN:'login', VAULT:'vault' };
@@ -54,6 +55,7 @@ export default function App() {
       {route === ROUTES.GAME       && <SnakeGame onSecretGesture={() => setRoute(ROUTES.LOGIN)} />}
       {route === ROUTES.LOGIN      && <VaultLogin onSuccess={() => setRoute(ROUTES.VAULT)} onBack={() => setRoute(ROUTES.GAME)} />}
       {route === ROUTES.VAULT      && <><Vault onLogout={() => setRoute(ROUTES.GAME)} /><SSBlock active={true} /></>}
+      <AlertHost />
     </View>
   );
 }

@@ -13,7 +13,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { AppState } from 'react-native';
-import { fbGet, fbSet } from '../utils/chatBackend';
+import { fbGet, fbSet, pruneOldMessages } from '../utils/chatBackend';
 
 // Same AsyncStorage keys ChatTab uses so both agree on identity/contacts.
 const KEY_ID  = 'knot_chat_id';
@@ -22,6 +22,13 @@ const KEY_CON = 'knot_chat_contacts';
 const KEY_LAST_READ = 'knot_chat_last_read';
 const POLL_MS = 4000;      // check for new incoming messages every 4s
 const PRESENCE_MS = 15000; // "I'm alive" heartbeat every 15s
+const PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000; // client-side "cron": once a day per room
+const pruneKeyFor = (path) => `knot_chat_pruned_at:${path}`;
+
+// Set by ChatTab while a thread is open on-screen, so this hook doesn't
+// redundantly re-poll the same room ChatTab is already polling.
+let activeChatPubHex = null;
+export function setActiveChatContact(pubHex) { activeChatPubHex = pubHex; }
 
 function roomPath(a, b) {
   return 'chats/' + [a, b].sort().join('__');
@@ -75,8 +82,10 @@ export function useChatUnread() {
     const lastRead = await loadLastRead();
     const perContact = {};
     let total = 0;
-    // Fetch each room in parallel — small chats, cheap.
+    // Fetch each room in parallel, skipping whichever contact's thread is
+    // currently open on-screen — ChatTab already polls that room itself.
     await Promise.all(contacts.map(async (c) => {
+      if (c.pubHex === activeChatPubHex) return;
       const rp = roomPath(identity.pubHex, c.pubHex);
       const res = await fbGet(rp);
       if (!res.ok || !res.data || typeof res.data !== 'object') {
@@ -92,6 +101,17 @@ export function useChatUnread() {
       }
       perContact[c.pubHex] = n;
       total += n;
+
+      // Client-side "cron": sweep messages older than 7 days once a day per
+      // room, using the data we just downloaded — no extra GET. Covers
+      // rooms that never get opened in ChatTab, which wouldn't otherwise
+      // get pruned.
+      const pKey = pruneKeyFor(rp);
+      const lastPrune = Number(await AsyncStorage.getItem(pKey)) || 0;
+      if (Date.now() - lastPrune >= PRUNE_INTERVAL_MS) {
+        await AsyncStorage.setItem(pKey, String(Date.now()));
+        pruneOldMessages(rp, res.data).catch(() => {});
+      }
     }));
     setState({ total, perContact });
   }, []);
@@ -109,19 +129,34 @@ export function useChatUnread() {
       if (cancelled) return;
       pollOnce();
       beatPresence(true);
-      pollTimer.current     = setInterval(async () => { await refreshRoster(); pollOnce(); }, POLL_MS);
-      presenceTimer.current = setInterval(() => beatPresence(true), PRESENCE_MS);
+      startTimers();
     })();
 
+    function startTimers() {
+      stopTimers();
+      pollTimer.current     = setInterval(async () => { await refreshRoster(); pollOnce(); }, POLL_MS);
+      presenceTimer.current = setInterval(() => beatPresence(true), PRESENCE_MS);
+    }
+    function stopTimers() {
+      if (pollTimer.current)     clearInterval(pollTimer.current);
+      if (presenceTimer.current) clearInterval(presenceTimer.current);
+      pollTimer.current = null;
+      presenceTimer.current = null;
+    }
+
     const sub = AppState.addEventListener('change', (next) => {
-      if (next === 'active') { refreshRoster().then(() => { pollOnce(); beatPresence(true); }); }
-      else                   { beatPresence(false); }
+      if (next === 'active') {
+        refreshRoster().then(() => { pollOnce(); beatPresence(true); });
+        startTimers(); // resume — was stopped while backgrounded
+      } else {
+        beatPresence(false);
+        stopTimers();  // app not visible — no need to keep polling full rooms
+      }
     });
 
     return () => {
       cancelled = true;
-      if (pollTimer.current)     clearInterval(pollTimer.current);
-      if (presenceTimer.current) clearInterval(presenceTimer.current);
+      stopTimers();
       sub.remove();
       beatPresence(false);
     };

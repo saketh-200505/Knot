@@ -29,12 +29,8 @@ jobs:
           node-version: '20'
           cache: npm
 
-      # npm install, not npm ci: there is no Node on the dev machine right
-      # now, so package-lock.json can't be refreshed locally when a
-      # dependency is added, and npm ci hard-fails on any lock/manifest
-      # mismatch. Switch back to `npm ci` once the lockfile is regenerated.
       - name: Install Dependencies
-        run: npm install
+        run: npm ci
 
       - name: Install Expo CLI
         run: npm install -g expo-cli

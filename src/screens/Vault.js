@@ -22,11 +22,12 @@ import {
 } from '../utils/crypto';
 import {
   getPhotoIndex, addPhotoToIndex, removePhotoFromIndex,
+  backfillPhotoFileNames,
   storage, KEYS, getSessionDuration, getGesture,
   getGroups, addGroup, findGroupsByFingerprint, removeGroup,
   getAuditLog, clearAuditLog, logEvent,
-  getBackupDirUri, setBackupDirUri,
-  isStoragePromptShown, setStoragePromptShown,
+  getSavedDirUri, setSavedDirUri,
+  resolveFilePath, invalidateDirListingCache,
   prettyFilename,
 } from '../utils/storage';
 import { useSession }  from '../hooks/useSession';
@@ -195,6 +196,17 @@ export function Vault({ onLogout }) {
   const [saveGroup,         setSaveGroup]         = useState(null);
   const [saveViaNew,        setSaveViaNew]        = useState(false);
 
+  // ── Move-between-groups state ───────────────────────────────────────────
+  // Declared here with the rest of the modal state because the BackHandler
+  // effect below lists these in its dependency array, which is evaluated
+  // during render — declaring them further down would hit the temporal dead
+  // zone on the very first render.
+  const [moveViaNew,        setMoveViaNew]        = useState(false);
+  const [moveIds,           setMoveIds]           = useState(null);  // photo ids being moved
+  const [showMovePick,      setShowMovePick]      = useState(false);
+  const [movePassPrompt,    setMovePassPrompt]    = useState(null);  // { kind:'source'|'target', group }
+  const moveCtx = useRef(null); // { ids, target, targetKey, sourcePw, needsSourcePw }
+
   const [dur,      setDur]      = useState(3);
   const [gesture,  setGesture]  = useState([...DEFAULT_GESTURE]);
   const [recMode,  setRecMode]  = useState(false);
@@ -206,16 +218,22 @@ export function Vault({ onLogout }) {
 
   const toast_ = useCallback((msg, type='info') => setToast({visible:true, msg, type}), []);
 
-  const [backupDirUri, setBackupDirUriState] = useState(null);
-  const [verifyingBackup, setVerifyingBackup] = useState(false);
+  const [savedDirUri, setSavedDirUriState] = useState(null);
+  const [verifyingFolder, setVerifyingFolder] = useState(false);
+  // savedDirUri as React state is one render behind inside async handlers, so
+  // anything that writes files reads this ref instead.
+  const savedDirRef = useRef(null);
+  useEffect(() => { savedDirRef.current = savedDirUri; }, [savedDirUri]);
 
   const loadPhotos = useCallback(async () => setPhotos(await getPhotoIndex()), []);
   const loadGroups = useCallback(async () => setGroups(await getGroups()), []);
   const loadAudit  = useCallback(async () => setAuditLog(await getAuditLog()), []);
 
   useEffect(() => {
-    Promise.all([getPhotoIndex(), getGroups(), getSessionDuration(), getGesture(), getAuditLog(), getBackupDirUri()])
-      .then(([p,g,d,ges,a,bd]) => { setPhotos(p); setGroups(g); setDur(d); setGesture(ges); setAuditLog(a); setBackupDirUriState(bd); });
+    // backfillPhotoFileNames() doubles as the index load — it returns the
+    // index and only writes when an older entry is missing its fileName.
+    Promise.all([backfillPhotoFileNames(), getGroups(), getSessionDuration(), getGesture(), getAuditLog(), getSavedDirUri()])
+      .then(([p,g,d,ges,a,sd]) => { setPhotos(p); setGroups(g); setDur(d); setGesture(ges); setAuditLog(a); setSavedDirUriState(sd); savedDirRef.current = sd; });
   }, []);
   useEffect(() => { if (tab===3) { loadAudit(); loadGroups(); } }, [tab]);
   useEffect(() => { if (session.showExtend) setShowExtend(true); }, [session.showExtend]);
@@ -229,9 +247,11 @@ export function Vault({ onLogout }) {
       if (showExtend)       { setShowExtend(false); session.wipe(); return true; }
       if (showExport)       { setShowExport(false); return true; }
       if (showShareDecrypt) { setShowShareDecrypt(false); setShareDecryptIds(null); return true; }
-      if (showNewPass)      { setShowNewPass(false); setPending([]); setSaveViaNew(false); return true; }
+      if (movePassPrompt)   { setMovePassPrompt(null); moveCtx.current=null; setMoveIds(null); return true; }
+      if (showMovePick)     { setShowMovePick(false); moveCtx.current=null; setMoveIds(null); return true; }
+      if (showNewPass)      { setShowNewPass(false); setPending([]); setSaveViaNew(false); setMoveViaNew(false); return true; }
       if (showExistingPass) { setShowExistingPass(null); setPending([]); return true; }
-      if (showNewLabel)     { setShowNewLabel(false); setPending([]); setSaveViaNew(false); setNewLabelError(''); return true; }
+      if (showNewLabel)     { setShowNewLabel(false); setPending([]); setSaveViaNew(false); setMoveViaNew(false); setNewLabelError(''); return true; }
       if (showGroupPick)    { setShowGroupPick(false); setPending([]); return true; }
       if (saveGroup)        { setSaveGroup(null); return true; }
       if (savePending)      { setSavePending(null); return true; }
@@ -245,6 +265,7 @@ export function Vault({ onLogout }) {
     });
     return () => sub.remove();
   }, [showChPw, showUnlock, showExtend, showExport, showShareDecrypt, showNewPass,
+      movePassPrompt, showMovePick,
       showExistingPass, showNewLabel, showGroupPick, saveGroup, savePending,
       viewVideo, viewPhoto, selectMode, openGroup, tab, session, onLogout]);
 
@@ -276,22 +297,22 @@ export function Vault({ onLogout }) {
     } catch(e) { toast_('Camera error: ' + e.message, 'error'); }
   };
 
-  // Writes a freshly-sealed file to wherever the vault's primary storage
-  // currently is. If the user has chosen a visible backup folder, files go
-  // straight there (flat — no subfolders, since Expo's SAF createFileAsync
-  // is documented to silently ignore nested folder URIs and always write to
-  // the granted root regardless of which subfolder you pass it
-  // — see github.com/expo/expo/issues/16954). Group ownership is kept clear
-  // via the filename itself instead. Falls back to the original VAULT_DIR
-  // sandbox when no backup folder has been chosen.
-  // If a SAF write fails because the URI's grant is dead (uninstall,
-  // folder moved, OS wipe of grants), we clear it once so future adds
-  // and this same import both fall through to the internal sandbox.
-  // Otherwise every subsequent import would keep hitting the same wall.
-  const invalidateBackupDir = async (reason) => {
-    try { await setBackupDirUri(null); } catch {}
-    setBackupDirUriState(null);
-    toast_(`Backup folder unavailable (${reason}). Falling back to internal storage — re-pick it in Settings if you still want an external copy.`, 'error');
+  // Writes a freshly-sealed file into the user's Saved Folder — the vault's
+  // primary storage. Files go in flat, with no subfolders: Expo's SAF
+  // createFileAsync silently ignores nested folder URIs and always writes to
+  // the granted root (github.com/expo/expo/issues/16954), so group ownership
+  // is carried by the filename instead.
+  //
+  // writeToInternal is the fallback for iOS (no SAF there — documentDirectory
+  // is reachable from the Files app) and for the case where a grant dies
+  // mid-import. It is no longer a normal Android outcome: encryption is gated
+  // on having a folder, so files can't quietly land somewhere invisible.
+  const invalidateSavedDir = async (reason) => {
+    try { await setSavedDirUri(null); } catch {}
+    setSavedDirUriState(null);
+    savedDirRef.current = null;
+    invalidateDirListingCache();
+    toast_(`Saved Folder unavailable (${reason}). Falling back to internal storage — re-pick it in Settings.`, 'error');
   };
 
   const writeToInternal = async (group, filename, b64) => {
@@ -302,31 +323,63 @@ export function Vault({ onLogout }) {
     return path;
   };
 
-  const writeVaultFile = async (group, id, sealedBytes, dirUriOverride) => {
+  // Returns { uri, fileName }. The filename is what makes the file findable
+  // again after the folder moves, so callers must store it on the index entry.
+  const writeVaultFile = async (group, sealedBytes, dirUriOverride) => {
     const b64 = uint8ToBase64(sealedBytes);
     const filename = prettyFilename({ kind: 'vault', groupLabel: group?.label });
     // dirUriOverride is used right after ensureStorageReady() may have just
-    // picked a new folder in THIS same call — backupDirUri (React state)
+    // picked a new folder in THIS same call — savedDirUri (React state)
     // wouldn't be updated yet in this closure, so the caller passes the
     // freshly-known value explicitly instead of us reading stale state.
-    const dir = dirUriOverride !== undefined ? dirUriOverride : backupDirUri;
+    const dir = dirUriOverride !== undefined ? dirUriOverride : savedDirRef.current;
     if (dir) {
       try {
         const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, filename, 'application/octet-stream');
         await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
-        return fileUri;
+        invalidateDirListingCache(dir); // the folder has a new file in it now
+        return { uri: fileUri, fileName: filename };
       } catch (e) {
         const msg = String(e?.message || e);
         // The classic "isn't writable" from a revoked SAF grant, or a
         // rejected createSAFFileAsync — either way the URI is dead.
         if (/isn't writable|not writable|permission|rejected|createSAFFile/i.test(msg)) {
-          await invalidateBackupDir('permission lost');
-          return writeToInternal(group, filename, b64);
+          await invalidateSavedDir('permission lost');
+          return { uri: await writeToInternal(group, filename, b64), fileName: filename };
         }
         throw e; // unknown reason — surface it via the existing toast path
       }
     }
-    return writeToInternal(group, filename, b64);
+    return { uri: await writeToInternal(group, filename, b64), fileName: filename };
+  };
+
+  // Every read of an encrypted file goes through here. A stored filePath is
+  // only a cache: re-picking the folder, moving the .dat files in a file
+  // manager, or reinstalling all invalidate it while the file itself is
+  // fine. resolveFilePath() falls back to finding the file by name in the
+  // current Saved Folder and repairs the index when it does.
+  const pathOf = async (entry) => resolveFilePath(entry, savedDirRef.current, 'photo');
+
+  const readSealed = async (entry) => {
+    const path = await pathOf(entry);
+    if (!path) return null;
+    return FileSystem.readAsStringAsync(path, { encoding: FileSystem.EncodingType.Base64 })
+      .catch(() => null);
+  };
+
+  // SAF documents and plain file:// paths need different delete calls, and
+  // getting it wrong fails silently — leaving an encrypted file on disk after
+  // the user asked for it to be removed.
+  const deleteAnyPath = async (path) => {
+    if (!path) return;
+    try {
+      if (path.startsWith('content://')) {
+        await FileSystem.StorageAccessFramework.deleteAsync(path);
+        invalidateDirListingCache();
+      } else {
+        await FileSystem.deleteAsync(path, { idempotent: true });
+      }
+    } catch { /* already gone, or grant lost — nothing more we can do */ }
   };
 
   // Some picker URIs can't be read directly by expo-file-system:
@@ -359,10 +412,10 @@ export function Vault({ onLogout }) {
     const bytes  = base64ToUint8(b64);
     const sealed = group ? await sealWithKey(bytes, key, salt, group.kdfParams || DEFAULT_ARGON2_PARAMS) : await seal(bytes, passphrase);
     const id     = genId();
-    const path   = await writeVaultFile(group, id, sealed, dirUriOverride);
+    const { uri: path, fileName } = await writeVaultFile(group, sealed, dirUriOverride);
     const isVid  = asset.type==='video' || (asset.mimeType||'').startsWith('video/');
     return {
-      id, filePath:path,
+      id, filePath:path, fileName,
       mimeType:  asset.mimeType||(isVid?'video/mp4':'image/jpeg'),
       mediaType: isVid?'video':'image',
       name:      asset.fileName||`${isVid?'video':'photo'}_${id}`,
@@ -380,7 +433,9 @@ export function Vault({ onLogout }) {
       toast_('No files selected — please try again', 'error');
       return;
     }
-    const freshDirUri = await ensureStorageReady();
+    const gate = await storageGate();
+    if (!gate.ok) return; // pendingRef is left intact so they can retry
+    const freshDirUri = gate.dir;
     setProc(`Encrypting 0 of ${files.length}`);
     if (!freshDirUri) {
       await ensureDir(VAULT_DIR);
@@ -478,7 +533,23 @@ export function Vault({ onLogout }) {
       await loadGroups();
       await logEvent('group_created', g.label);
 
-      if (saveViaNew) {
+      if (moveViaNew) {
+        // Group created as the destination of a move — we already hold the
+        // passphrase, so derive the key here and go straight to confirmation.
+        setMoveViaNew(false);
+        setProc('');
+        const ctx = moveCtx.current;
+        if (ctx) {
+          ctx.target    = g;
+          ctx.targetKey = await keyForGroup(g, pw);
+          session.rememberGroupKey(g.id, ctx.targetKey);
+          if (ctx.needsSourcePw && !ctx.sourcePw) {
+            setTimeout(() => setMovePassPrompt({ kind:'source', group:g }), 350);
+          } else {
+            setTimeout(confirmMove, 350);
+          }
+        }
+      } else if (saveViaNew) {
         setSaveViaNew(false);
         const sp = savePending; setSavePending(null);
         await saveToVault(sp, pw, g);
@@ -494,30 +565,41 @@ export function Vault({ onLogout }) {
   };
 
   // ── UNLOCK ────────────────────────────────────────────────────────────────
+  // Derives the key for one group from its passphrase. Shared by unlocking
+  // and by the move flow, so both honour a group's recorded kdf/params.
+  const keyForGroup = async (g, pw) => {
+    const salt = base64ToUint8(g.salt);
+    return g.kdf === 'argon2id'
+      ? deriveKey(pw, salt, g.kdfParams || DEFAULT_ARGON2_PARAMS)
+      : deriveKeyLegacy(pw, salt, DEFAULT_KDF_ITERATIONS);
+  };
+
+  // `keys` maps groupId -> derived key. The session caches these so a later
+  // move into an already-open group doesn't re-ask for a passphrase it just
+  // accepted.
   const buildTargets = async (pw, tg) => {
     const fp = await passphraseFingerprint(pw);
     if (tg && tg.id!=='__ungrouped') {
-      if (tg.fingerprint!==fp) return {targets:[],labels:[],wrong:true};
-      const salt=base64ToUint8(tg.salt);
-      const key = tg.kdf === 'argon2id' ? await deriveKey(pw,salt,tg.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
-      return { targets:photos.filter(p=>p.groupId===tg.id).map(p=>({photo:p,key})), labels:[tg.label], wrong:false };
+      if (tg.fingerprint!==fp) return {targets:[],labels:[],keys:{},wrong:true};
+      const key = await keyForGroup(tg, pw);
+      return { targets:photos.filter(p=>p.groupId===tg.id).map(p=>({photo:p,key})), labels:[tg.label], keys:{[tg.id]:key}, wrong:false };
     }
     const matching = await findGroupsByFingerprint(fp);
-    const targets=[]; const labels=[];
+    const targets=[]; const labels=[]; const keys={};
     for (const g of matching) {
-      const salt=base64ToUint8(g.salt);
-      const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
+      const key = await keyForGroup(g, pw);
+      keys[g.id] = key;
       photos.filter(p=>p.groupId===g.id).forEach(p=>targets.push({photo:p,key}));
       labels.push(g.label);
     }
     photos.filter(p=>!p.groupId).forEach(p=>targets.push({photo:p,key:null}));
-    return {targets, labels, wrong:false};
+    return {targets, labels, keys, wrong:false};
   };
 
   const readFiles = async (targets) => {
     const out=[];
     for (const {photo,key} of targets) {
-      const b64 = await FileSystem.readAsStringAsync(photo.filePath,{encoding:FileSystem.EncodingType.Base64}).catch(()=>null);
+      const b64 = await readSealed(photo);
       if (b64) out.push({...photo, sealedB64:b64, key});
     }
     return out;
@@ -525,12 +607,12 @@ export function Vault({ onLogout }) {
 
   const handleUnlock = async (pw) => {
     const tg=unlockGroup; setShowUnlock(false); setUnlockGroup(null);
-    const {targets,labels,wrong} = await buildTargets(pw,tg);
+    const {targets,labels,keys,wrong} = await buildTargets(pw,tg);
     if (wrong)          { toast_('Wrong passphrase for this group','error'); return; }
     if (!targets.length){ toast_('No items match that passphrase','error'); return; }
     setProc(`Decrypting 0 of ${targets.length}`);
     const files = await readFiles(targets);
-    const count = await session.unlock(files, pw, (d,t)=>setProc(`Decrypting ${Math.min(d+1,t)} of ${t}`));
+    const count = await session.unlock(files, pw, (d,t)=>setProc(`Decrypting ${Math.min(d+1,t)} of ${t}`), keys);
     setProc('');
     count===0 ? toast_('Wrong passphrase — nothing unlocked','error')
               : toast_(`${count} item${count!==1?'s':''} unlocked (${labels.join(', ')})`, 'success');
@@ -538,11 +620,11 @@ export function Vault({ onLogout }) {
 
   const handleExtend = async (pw) => {
     setShowExtend(false);
-    const {targets} = await buildTargets(pw,null);
+    const {targets,keys} = await buildTargets(pw,null);
     if (!targets.length) { toast_('Wrong passphrase','error'); session.wipe(); return; }
     setProc(`Decrypting 0 of ${targets.length}`);
     const files = await readFiles(targets);
-    const count = await session.extend(files, pw, (d,t)=>setProc(`Decrypting ${Math.min(d+1,t)} of ${t}`));
+    const count = await session.extend(files, pw, (d,t)=>setProc(`Decrypting ${Math.min(d+1,t)} of ${t}`), keys);
     setProc('');
     count>0 ? toast_('Session extended','success') : toast_('Wrong passphrase','error');
   };
@@ -561,7 +643,8 @@ export function Vault({ onLogout }) {
       const photo=targets[i];
       try {
         setProc(`Exporting ${i+1} of ${targets.length}`);
-        const b64    = await FileSystem.readAsStringAsync(photo.filePath,{encoding:FileSystem.EncodingType.Base64});
+        const b64    = await readSealed(photo);
+        if (!b64) throw new Error('file missing');
         const plain  = await unseal(base64ToUint8(b64), pw, {iterations:photo.kdfIterations||LEGACY_KDF_ITERATIONS});
         const ext    = (photo.mimeType||'image/jpeg').split('/')[1]||'jpg';
         const out    = `${FileSystem.cacheDirectory}exp_${photo.id}.${ext}`;
@@ -599,7 +682,11 @@ export function Vault({ onLogout }) {
           style: 'destructive',
           onPress: async () => {
             for (const p of gPhotos) {
-              await FileSystem.deleteAsync(p.filePath, { idempotent: true }).catch(() => {});
+              // Resolve first — deleting a stale path is a silent no-op that
+              // would leave the encrypted file behind after the user asked
+              // for it to be gone.
+              const path = await pathOf(p);
+              if (path) await deleteAnyPath(path);
               await removePhotoFromIndex(p.id);
             }
             await removeGroup(g.id);
@@ -618,7 +705,7 @@ export function Vault({ onLogout }) {
       {text:'Remove',style:'destructive', onPress:async()=>{
         for (const id of selected) {
           const p=photos.find(x=>x.id===id);
-          if(p){ await FileSystem.deleteAsync(p.filePath,{idempotent:true}).catch(()=>{}); await removePhotoFromIndex(id); }
+          if(p){ const path=await pathOf(p); if(path) await deleteAnyPath(path); await removePhotoFromIndex(id); }
         }
         await loadPhotos(); setSelectMode(false); setSelected(new Set());
         toast_('Removed','warn'); logEvent('delete',`${selected.size}`).catch(()=>{});
@@ -630,8 +717,15 @@ export function Vault({ onLogout }) {
     const targets = id ? [photos.find(p=>p.id===id)].filter(Boolean) : photos.filter(p=>selected.has(p.id));
     if (!targets.length) return;
     if (!(await Sharing.isAvailableAsync())) { toast_('Sharing not available','error'); return; }
-    for (const p of targets) await Sharing.shareAsync(p.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'});
-    logEvent('share_encrypted',`${targets.length}`).catch(()=>{});
+    let shared = 0;
+    for (const p of targets) {
+      const path = await pathOf(p);
+      if (!path) continue;
+      await Sharing.shareAsync(path,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'});
+      shared++;
+    }
+    if (shared < targets.length) toast_(`${targets.length-shared} file${targets.length-shared!==1?'s':''} could not be found on disk`,'warn');
+    logEvent('share_encrypted',`${shared}`).catch(()=>{});
     setSelectMode(false); setSelected(new Set());
   };
 
@@ -686,7 +780,8 @@ export function Vault({ onLogout }) {
         if (uri) {
           if (p.mediaType!=='video') { await shareDecryptedNow([p]); count++; }
         } else {
-          const b64   = await FileSystem.readAsStringAsync(p.filePath,{encoding:FileSystem.EncodingType.Base64});
+          const b64   = await readSealed(p);
+          if (!b64) throw new Error('file missing');
           const plain = await unseal(base64ToUint8(b64), pw, {iterations:p.kdfIterations||LEGACY_KDF_ITERATIONS});
           const ext   = (p.mimeType||'image/jpeg').split('/')[1]||'jpg';
           const tmp   = `${FileSystem.cacheDirectory}sh_${p.id}.${ext}`;
@@ -711,127 +806,330 @@ export function Vault({ onLogout }) {
       {text:'Cancel', style:'cancel'},
       {text:'Encrypted file', onPress:()=>shareEnc(id)},
       {text:'Actual photo', onPress:()=>shareDecrypted(id)},
-      {text:'Save to visible folder', onPress:()=>backupToFolder(id)},
+      {text:'Copy to Saved Folder', onPress:()=>copyToSavedFolder(id)},
     ]);
   };
 
   // Lets the user pick any normal, visible folder (Downloads, a custom
   // "Knot" folder, etc.) via Android's folder picker, and remembers it.
-  // Unlike Android/data, anything copied here shows up in any file manager —
+  // Unlike Android/data, anything written here shows up in any file manager —
   // Android doesn't hide user-chosen SAF folders the way it hides app-private
   // external storage.
-  const chooseBackupFolder = async () => {
+  const chooseSavedFolder = async () => {
     if (Platform.OS !== 'android') { toast_('Only available on Android','warn'); return null; }
     const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
     if (!perm.granted) return null;
-    await setBackupDirUri(perm.directoryUri);
-    setBackupDirUriState(perm.directoryUri);
+    await setSavedDirUri(perm.directoryUri);
+    setSavedDirUriState(perm.directoryUri);
+    savedDirRef.current = perm.directoryUri;
+    invalidateDirListingCache();
     return perm.directoryUri;
   };
 
-  // Runs before every encryption. Two jobs:
-  //   1. First time ever (no folder chosen, never asked before) — ask the
-  //      user where to save, since it's easy to forget this lives in
-  //      Settings otherwise.
-  //   2. Every other time — if a folder WAS chosen, quietly verify it still
-  //      exists/is writable. If it's gone (deleted, moved, permission
-  //      revoked), clear it and ask again before continuing.
-  // Once the user has answered (either a folder or "use app storage"), we
-  // don't ask again automatically — they can always change it in Settings.
-  // Android only for now.
+  // Gate in front of every encryption. Encrypted photos must end up somewhere
+  // the user can actually see and back up, so this refuses to let encryption
+  // proceed until a folder exists and is provably writable.
+  //
+  // Returns the folder URI, or null meaning "caller must abort". The old
+  // behaviour — offering "Use App Storage" and then never asking again —
+  // silently buried files in Android/data, which Android 11+ hides from every
+  // file manager. There is no such escape hatch now.
+  //
+  // iOS has no SAF and its documentDirectory is already reachable from the
+  // Files app, so it returns null-with-permission via the platform check in
+  // the callers' guard below.
   const ensureStorageReady = async () => {
-    if (Platform.OS !== 'android') return backupDirUri;
+    if (Platform.OS !== 'android') return null; // iOS: writeToInternal is fine
 
-    if (backupDirUri) {
+    let dir = savedDirRef.current;
+    if (dir) {
       try {
-        const testUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, `.knot_verify_${Date.now()}`, 'text/plain');
+        const testUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, `.knot_verify_${Date.now()}`, 'text/plain');
         await FileSystem.StorageAccessFramework.deleteAsync(testUri);
-        return backupDirUri; // folder still good, nothing to ask
+        return dir; // folder still good, nothing to ask
       } catch {
-        await setBackupDirUri(null);
-        setBackupDirUriState(null);
-        // fall through to the prompt below
+        await setSavedDirUri(null);
+        setSavedDirUriState(null);
+        savedDirRef.current = null;
+        invalidateDirListingCache();
+        dir = null;
       }
-    } else if (await isStoragePromptShown()) {
-      return null; // already asked once, user chose to skip — don't nag again
     }
 
     return new Promise(resolve => {
       showAlert(
-        'Where should encrypted photos be saved?',
-        'Choose a visible folder on your phone (like Downloads) so your encrypted files are easy to find. You can change this anytime in Settings.',
+        dir === null && savedDirUri ? 'Saved Folder is no longer reachable' : 'Choose where to save encrypted photos',
+        'Knot needs a folder on your phone — Downloads, or a folder you make yourself — to keep encrypted files in. ' +
+        'This is where your photos actually live, not a backup, so nothing can be encrypted until one is set. ' +
+        'You can change it later in Settings.',
         [
-          { text: 'Use App Storage', style: 'cancel', onPress: async () => { await setStoragePromptShown(); resolve(null); } },
-          { text: 'Choose Folder', onPress: async () => { const dir = await chooseBackupFolder(); await setStoragePromptShown(); resolve(dir); } },
+          { text: 'Not now', style: 'cancel', onPress: () => resolve(null) },
+          { text: 'Choose Folder', onPress: async () => resolve(await chooseSavedFolder()) },
         ],
         { cancelable: false }
       );
     });
   };
 
+  // True when encryption may proceed. Android requires a real folder; iOS
+  // always passes because writeToInternal lands somewhere the user can reach.
+  const storageGate = async () => {
+    const dir = await ensureStorageReady();
+    if (Platform.OS !== 'android') return { ok: true, dir: null };
+    if (!dir) {
+      setProc('');
+      toast_('Choose a folder first — Settings → Saved Folder', 'error');
+      return { ok: false, dir: null };
+    }
+    return { ok: true, dir };
+  };
+
   // Does a real test write + delete against the saved folder so the user
   // finds out right away if the SAF grant has gone stale (folder deleted,
   // SD card removed, permission revoked in Android settings) instead of
   // only discovering it mid-share later.
-  const verifyBackupFolder = async () => {
-    if (!backupDirUri) { toast_('No folder chosen yet','warn'); return; }
-    setVerifyingBackup(true);
+  const verifySavedFolder = async () => {
+    const dir = savedDirRef.current;
+    if (!dir) { toast_('No folder chosen yet','warn'); return; }
+    setVerifyingFolder(true);
     try {
-      const testUri = await FileSystem.StorageAccessFramework.createFileAsync(backupDirUri, `.knot_verify_${Date.now()}`, 'text/plain');
+      const testUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, `.knot_verify_${Date.now()}`, 'text/plain');
       await FileSystem.writeAsStringAsync(testUri, 'ok');
       await FileSystem.StorageAccessFramework.deleteAsync(testUri);
+      invalidateDirListingCache(dir);
       toast_('Folder access OK','success');
     } catch (e) {
       toast_('Folder access lost — please choose again','error');
-      await setBackupDirUri(null); setBackupDirUriState(null);
+      await setSavedDirUri(null); setSavedDirUriState(null); savedDirRef.current = null;
+      invalidateDirListingCache();
     } finally {
-      setVerifyingBackup(false);
+      setVerifyingFolder(false);
     }
   };
 
   // Copies the raw encrypted .dat (never decrypted) into the chosen visible
   // folder. Prompts to pick a folder first if one hasn't been chosen yet.
-  const backupToFolder = async (id) => {
+  const copyToSavedFolder = async (id) => {
     const all = id ? [photos.find(p=>p.id===id)].filter(Boolean) : photos.filter(p=>selected.has(p.id));
     if (!all.length) return;
-    let dir = backupDirUri;
+    let dir = savedDirRef.current;
     if (!dir) {
-      dir = await chooseBackupFolder();
+      dir = await chooseSavedFolder();
       if (!dir) return; // user cancelled the picker
     }
     // Anything whose filePath is already a content:// URI was written
-    // straight into the visible folder at encryption time (current default
-    // once a backup folder is set) — copying it again would just create a
-    // pointless duplicate sitting right next to the original.
-    const targets = all.filter(p => !p.filePath.startsWith('content://'));
-    if (!targets.length) { toast_('Already in your visible folder','warn'); setSelectMode(false); setSelected(new Set()); return; }
+    // straight into the Saved Folder at encryption time (the normal case now)
+    // — copying it again would just create a pointless duplicate sitting
+    // right next to the original.
+    const targets = all.filter(p => !String(p.filePath||'').startsWith('content://'));
+    if (!targets.length) { toast_('Already in your Saved Folder','warn'); setSelectMode(false); setSelected(new Set()); return; }
     setProc(`Saving 0 of ${targets.length}`);
     let count = 0;
     for (let i=0;i<targets.length;i++) {
       const p = targets[i];
       setProc(`Saving ${i+1} of ${targets.length}`);
       try {
-        const b64 = await FileSystem.readAsStringAsync(p.filePath,{encoding:FileSystem.EncodingType.Base64});
-        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, `${p.name||p.id}`, 'application/octet-stream');
+        const b64 = await readSealed(p);
+        if (!b64) continue;
+        // Use the on-disk name, not the original photo name — the Knot_<Group>_…
+        // form is what makes the copy identifiable and re-linkable later.
+        const outName = p.fileName || prettyFilename({ kind:'vault', groupLabel:p.groupLabel });
+        const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(dir, outName, 'application/octet-stream');
         await FileSystem.writeAsStringAsync(fileUri, b64, {encoding:FileSystem.EncodingType.Base64});
+        invalidateDirListingCache(dir);
         count++;
       } catch (e) {
         // SAF permission can be revoked externally (folder deleted/moved) —
         // if writes start failing, re-prompt for a folder once and bail
         // rather than silently failing every remaining item.
-        if (i===0) { toast_('Could not write to that folder — pick again from Share','error'); await setBackupDirUri(null); setBackupDirUriState(null); break; }
+        if (i===0) { toast_('Could not write to that folder — choose it again in Settings','error'); await invalidateSavedDir('write failed'); break; }
       }
     }
     setProc(''); setSelectMode(false); setSelected(new Set());
-    count>0 ? toast_(`${count} encrypted file${count!==1?'s':''} saved`,'success') : toast_('Save failed','error');
-    if (count>0) logEvent('backup_to_folder',`${count}`).catch(()=>{});
+    count>0 ? toast_(`${count} encrypted file${count!==1?'s':''} copied`,'success') : toast_('Save failed','error');
+    if (count>0) logEvent('copy_to_saved_folder',`${count}`).catch(()=>{});
   };
 
+
+  // ── MOVE BETWEEN GROUPS ───────────────────────────────────────────────────
+  // Each group has its own passphrase, and a file's key is
+  // Argon2id(passphrase, group.salt) — so a photo sealed for group A is
+  // simply unreadable with group B's key. A move is therefore a real
+  // decrypt-then-reseal; there is no metadata-only shortcut, and pretending
+  // otherwise would leave files that silently never open again.
+  //
+  // What we CAN avoid is asking twice for passphrases the session already
+  // holds: session.getGroupKey() returns a key derived during this session's
+  // unlock, and decryptedMap already holds the plaintext of anything open.
+  const startMove = (ids) => {
+    const list = Array.isArray(ids) ? ids : [ids];
+    if (!list.length) return;
+    // Decide up front whether the originals still need their own passphrase.
+    // It has to happen here rather than after the target is chosen, because
+    // creating a new destination group bypasses onMoveTargetPicked.
+    const needsSourcePw = photos
+      .filter(p => list.includes(p.id))
+      .some(p => !session.decryptedMap[p.id]);
+    moveCtx.current = { ids: list, needsSourcePw };
+    setMoveIds(list);
+    setShowMovePick(true);
+  };
+
+  // Plaintext for one photo: from the open session when available, else by
+  // decrypting with the source group's passphrase.
+  const plainBytesFor = async (photo, sourcePw) => {
+    const uri = session.decryptedMap[photo.id];
+    if (uri) {
+      // Videos are cached as a file path; images as a data: URI.
+      if (uri.startsWith('data:')) return base64ToUint8(uri.split(',')[1]);
+      const b64 = await FileSystem.readAsStringAsync(uri, {encoding:FileSystem.EncodingType.Base64});
+      return base64ToUint8(b64);
+    }
+    if (!sourcePw) return null;
+    const sealed = await readSealed(photo);
+    if (!sealed) return null;
+    return unseal(base64ToUint8(sealed), sourcePw, {iterations:photo.kdfIterations||LEGACY_KDF_ITERATIONS});
+  };
+
+  // Target chosen. Work out whether we still need either passphrase, and ask
+  // only for the ones the session can't supply.
+  const onMoveTargetPicked = async (target) => {
+    setShowMovePick(false);
+    const ctx = moveCtx.current;
+    if (!ctx) return;
+    ctx.target = target;
+
+    const movers = photos.filter(p => ctx.ids.includes(p.id));
+    if (movers.some(p => p.groupId === target.id)) {
+      const already = movers.filter(p => p.groupId === target.id).length;
+      if (already === movers.length) { toast_(`Already in "${target.label}"`, 'warn'); moveCtx.current = null; setMoveIds(null); return; }
+    }
+
+    ctx.targetKey = session.getGroupKey(target.id);
+
+    // The 350ms waits let the picker sheet finish animating out before the
+    // next sheet or alert appears — the same pacing the import flow uses.
+    if (ctx.needsSourcePw) { setTimeout(() => setMovePassPrompt({ kind:'source', group:target }), 350); return; }
+    if (!ctx.targetKey)    { setTimeout(() => setMovePassPrompt({ kind:'target', group:target }), 350); return; }
+    setTimeout(confirmMove, 350);
+  };
+
+  const onMovePass = async (pw) => {
+    const prompt = movePassPrompt;
+    setMovePassPrompt(null);
+    const ctx = moveCtx.current;
+    if (!ctx || !prompt) return;
+
+    if (prompt.kind === 'source') {
+      ctx.sourcePw = pw;
+      if (!ctx.targetKey) { setTimeout(() => setMovePassPrompt({ kind:'target', group:ctx.target }), 350); return; }
+      setTimeout(confirmMove, 350);
+      return;
+    }
+
+    // Target passphrase — check it against the group's fingerprint before
+    // deriving, so a typo can't re-seal everything under a key that will
+    // never open again.
+    setProc('Verifying…');
+    try {
+      const fp = await passphraseFingerprint(pw);
+      if (fp !== ctx.target.fingerprint) {
+        setProc('');
+        toast_(`Wrong passphrase for "${ctx.target.label}"`, 'error');
+        moveCtx.current = null; setMoveIds(null);
+        return;
+      }
+      ctx.targetKey = await keyForGroup(ctx.target, pw);
+      session.rememberGroupKey(ctx.target.id, ctx.targetKey);
+      setProc('');
+      setTimeout(confirmMove, 350);
+    } catch (e) {
+      setProc('');
+      toast_('Error: ' + e.message, 'error');
+      moveCtx.current = null; setMoveIds(null);
+    }
+  };
+
+  const confirmMove = () => {
+    const ctx = moveCtx.current;
+    if (!ctx?.target || !ctx.targetKey) return;
+    const n = ctx.ids.length;
+    showAlert(
+      `Move to "${ctx.target.label}"?`,
+      `${n} item${n!==1?'s':''} will be re-encrypted with "${ctx.target.label}"'s passphrase. ` +
+      `After this they open with that passphrase only.`,
+      [
+        { text:'Cancel', style:'cancel', onPress:()=>{ moveCtx.current=null; setMoveIds(null); } },
+        { text:'Move', onPress:runMove },
+      ]
+    );
+  };
+
+  const runMove = async () => {
+    const ctx = moveCtx.current;
+    if (!ctx?.target || !ctx.targetKey) return;
+    const { target, targetKey, sourcePw } = ctx;
+    moveCtx.current = null; setMoveIds(null);
+
+    const gate = await storageGate();
+    if (!gate.ok) return;
+
+    const movers  = photos.filter(p => ctx.ids.includes(p.id) && p.groupId !== target.id);
+    const salt    = base64ToUint8(target.salt);
+    const params  = target.kdfParams || DEFAULT_ARGON2_PARAMS;
+    let count = 0, firstErr = null;
+
+    for (let i = 0; i < movers.length; i++) {
+      const p = movers[i];
+      setProc(`Moving ${i+1} of ${movers.length}`);
+      await new Promise(r => setTimeout(r, 0));
+      try {
+        const plain = await plainBytesFor(p, sourcePw);
+        if (!plain) throw new Error('could not read the original');
+        const sealed = await sealWithKey(plain, targetKey, salt, params);
+        // Write the new file BEFORE removing the old one. If this is
+        // interrupted the worst case is a duplicate, never a lost photo.
+        const { uri: newPath, fileName } = await writeVaultFile(target, sealed, gate.dir);
+        const oldPath = await pathOf(p);
+        await addPhotoToIndex({
+          ...p,
+          id: genId(),
+          filePath: newPath,
+          fileName,
+          groupId: target.id,
+          groupLabel: target.label,
+          cryptoVersion: 4,
+          kdfIterations: null,
+          movedAt: Date.now(),
+        });
+        if (oldPath) await deleteAnyPath(oldPath);
+        await removePhotoFromIndex(p.id);
+        count++;
+      } catch (e) {
+        console.warn('[KNOT] move err:', e?.message, e?.stack);
+        if (!firstErr) firstErr = e?.message || String(e);
+      }
+    }
+
+    await loadPhotos();
+    setProc(''); setSelectMode(false); setSelected(new Set());
+    logEvent('move_group', `${count}/${movers.length} -> ${target.label}`).catch(()=>{});
+    if (count > 0) {
+      // The moved items are sealed under a different key now, so whatever the
+      // session was holding for them is stale. Tell the user plainly rather
+      // than leaving thumbnails that no longer match what's on disk.
+      toast_(`${count} item${count!==1?'s':''} moved to "${target.label}" — unlock that group to view`, 'success');
+    } else {
+      toast_('Move failed — ' + (firstErr || 'unknown error'), 'error');
+    }
+  };
 
   // ── SAVE SHARED TO VAULT ──────────────────────────────────────────────────
   const saveToVault = async (sp, pw, g) => {
     if (!sp?.items?.length) return;
-    const freshDirUri = await ensureStorageReady();
+    const gate = await storageGate();
+    if (!gate.ok) return;
+    const freshDirUri = gate.dir;
     const salt = base64ToUint8(g.salt);
     const key = g.kdf === 'argon2id' ? await deriveKey(pw,salt,g.kdfParams||DEFAULT_ARGON2_PARAMS) : deriveKeyLegacy(pw,salt,DEFAULT_KDF_ITERATIONS);
     let count = 0, firstErr = null;
@@ -840,9 +1138,10 @@ export function Vault({ onLogout }) {
       setProc(sp.items.length > 1 ? `Encrypting ${count+1} of ${sp.items.length}` : 'Encrypting…');
       try {
         const sealed = await sealWithKey(base64ToUint8(item.plainB64), key, salt, g.kdfParams||DEFAULT_ARGON2_PARAMS);
-        const id=genId(), path=await writeVaultFile(g, id, sealed, freshDirUri);
+        const id = genId();
+        const { uri: path, fileName } = await writeVaultFile(g, sealed, freshDirUri);
         const mime = item.mime||'image/jpeg';
-        await addPhotoToIndex({id,filePath:path,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:item.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
+        await addPhotoToIndex({id,filePath:path,fileName,mimeType:mime,mediaType:mime.startsWith('video/')?'video':'image',name:item.name||`photo_${id}`,addedAt:Date.now(),cryptoVersion:4,kdfIterations:null,groupId:g.id,groupLabel:g.label});
         count++;
       } catch(e) {
         console.warn('[KNOT] Save-to-vault err:', e?.message, e?.stack);
@@ -990,6 +1289,15 @@ export function Vault({ onLogout }) {
     const gp  = photos.filter(p=>g.id==='__ungrouped'?!p.groupId:p.groupId===g.id);
     const allOpen = gp.length>0 && gp.every(p=>session.decryptedMap[p.id]);
 
+    const onCardLongPress = (photo) => {
+      if (selectMode) return;
+      showAlert(photo.name || 'Item', 'What would you like to do?', [
+        { text:'Cancel', style:'cancel' },
+        { text:'Move to another group', onPress:()=>startMove([photo.id]) },
+        { text:'Select multiple…', onPress:()=>{setSelectMode(true);setSelected(new Set([photo.id]));} },
+      ]);
+    };
+
     const onCard = (photo) => {
       if (selectMode) {
         setSelected(prev=>{const s=new Set(prev); s.has(photo.id)?s.delete(photo.id):s.add(photo.id); return s;});
@@ -1032,7 +1340,7 @@ export function Vault({ onLogout }) {
               const sel=selected.has(photo.id);
               return (
                 <TouchableOpacity style={[dv.card,sel&&{borderColor:palette.dot,borderWidth:3}]}
-                  onPress={()=>onCard(photo)} onLongPress={()=>{setSelectMode(true);setSelected(new Set([photo.id]));}} activeOpacity={0.8}>
+                  onPress={()=>onCard(photo)} onLongPress={()=>onCardLongPress(photo)} activeOpacity={0.8}>
                   {uri ? (
                     <>
                       {photo.mediaType==='video'
@@ -1060,6 +1368,7 @@ export function Vault({ onLogout }) {
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{gap:8}}>
               {[
                 {label:'Export', color:COLORS.sky,    fn:()=>{setExportTarget(null);setShowExport(true);}},
+                {label:'Move',   color:COLORS.emerald,fn:()=>startMove([...selected])},
                 {label:'Share',  color:COLORS.purple,  fn:()=>promptShare(null)},
                 {label:'Delete', color:COLORS.rose,    fn:()=>deleteSelected()},
                 {label:'Cancel', color:COLORS.textMuted,fn:()=>{setSelectMode(false);setSelected(new Set());}},
@@ -1094,24 +1403,27 @@ export function Vault({ onLogout }) {
       </View>
 
       <View style={s.card}>
-        <Text style={s.cardTitle}>Backup Folder</Text>
-        <Text style={s.cardDesc}>Once chosen, new encrypted photos are saved here directly — visible in any file manager, unlike the app's private storage. Also where "Save to visible folder" copies older files to.</Text>
-        <Text style={{fontFamily:FONTS.mono,color:COLORS.textSecondary,fontSize:11,marginTop:6}} numberOfLines={2}>
-          {backupDirUri ? decodeURIComponent(backupDirUri.split('tree/')[1]||backupDirUri) : 'No folder chosen yet'}
+        <Text style={s.cardTitle}>Saved Folder</Text>
+        <Text style={s.cardDesc}>Where your encrypted photos live. Pick a folder you can see in any file manager — Android hides the app's own storage, so nothing can be encrypted until this is set.</Text>
+        <Text style={{fontFamily:FONTS.mono,color:savedDirUri?COLORS.textSecondary:COLORS.rose,fontSize:11,marginTop:6}} numberOfLines={2}>
+          {savedDirUri ? decodeURIComponent(savedDirUri.split('tree/')[1]||savedDirUri) : '⚠  No folder chosen — encryption is blocked'}
+        </Text>
+        <Text style={{fontFamily:FONTS.body,color:COLORS.textMuted,fontSize:11,marginTop:6,lineHeight:16}}>
+          Moved your files? Point this at the new folder — Knot finds them again by filename, so nothing needs re-importing.
         </Text>
         <View style={{flexDirection:'row',gap:8,flexWrap:'wrap',marginTop:8}}>
-          <TouchableOpacity style={s.pill} onPress={chooseBackupFolder} activeOpacity={0.7}>
-            <Text style={s.pillTxt}>{backupDirUri?'Change Folder':'Choose Folder'}</Text>
+          <TouchableOpacity style={s.pill} onPress={chooseSavedFolder} activeOpacity={0.7}>
+            <Text style={s.pillTxt}>{savedDirUri?'Change Folder':'Choose Folder'}</Text>
           </TouchableOpacity>
-          {!!backupDirUri && (
-            <TouchableOpacity style={s.pill} onPress={verifyBackupFolder} disabled={verifyingBackup} activeOpacity={0.7}>
-              {verifyingBackup
+          {!!savedDirUri && (
+            <TouchableOpacity style={s.pill} onPress={verifySavedFolder} disabled={verifyingFolder} activeOpacity={0.7}>
+              {verifyingFolder
                 ? <ActivityIndicator size="small" color={COLORS.textSecondary}/>
                 : <Text style={s.pillTxt}>Verify Access</Text>}
             </TouchableOpacity>
           )}
-          {!!backupDirUri && (
-            <TouchableOpacity style={[s.pill,{borderColor:COLORS.rose}]} onPress={()=>{setBackupDirUri(null);setBackupDirUriState(null);}} activeOpacity={0.7}>
+          {!!savedDirUri && (
+            <TouchableOpacity style={[s.pill,{borderColor:COLORS.rose}]} onPress={()=>{setSavedDirUri(null);setSavedDirUriState(null);savedDirRef.current=null;invalidateDirListingCache();}} activeOpacity={0.7}>
               <Text style={[s.pillTxt,{color:COLORS.rose}]}>Clear</Text>
             </TouchableOpacity>
           )}
@@ -1254,7 +1566,9 @@ export function Vault({ onLogout }) {
     const doShareEnc=async()=>{
       try {
         if (await Sharing.isAvailableAsync()) {
-          await Sharing.shareAsync(viewPhoto.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'});
+          const path = await pathOf(viewPhoto);
+          if (!path) { toast_('File not found in your Saved Folder','error'); return; }
+          await Sharing.shareAsync(path,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'});
           logEvent('share_encrypted',viewPhoto.name).catch(()=>{});
         }
       } catch(e) { toast_('Share failed: '+e.message,'error'); }
@@ -1264,7 +1578,7 @@ export function Vault({ onLogout }) {
         {text:'Cancel', style:'cancel'},
         {text:'Encrypted file', onPress:doShareEnc},
         {text:'Actual photo', onPress:doShare},
-        {text:'Save to visible folder', onPress:()=>backupToFolder(viewPhoto.id)},
+        {text:'Copy to Saved Folder', onPress:()=>copyToSavedFolder(viewPhoto.id)},
       ]);
     };
 
@@ -1350,7 +1664,7 @@ export function Vault({ onLogout }) {
         onShare={(vid)=>{
           showAlert('Share','Share the encrypted file or the actual video?',[
             {text:'Cancel',style:'cancel'},
-            {text:'Encrypted file',onPress:()=>{Sharing.isAvailableAsync().then(ok=>ok&&Sharing.shareAsync(vid.photo.filePath,{mimeType:'application/octet-stream',dialogTitle:'Share encrypted file'})).then(()=>logEvent('share_encrypted',vid.photo.name).catch(()=>{})).catch(e=>toast_('Share failed: '+e.message,'error'));}},
+            {text:'Encrypted file',onPress:()=>{shareEnc(vid.photo.id);}},
             {text:'Actual video',onPress:()=>{Sharing.isAvailableAsync().then(ok=>ok&&Sharing.shareAsync(vid.uri,{mimeType:vid.photo.mimeType||'video/mp4'})).then(()=>logEvent('share_decrypted',vid.photo.name).catch(()=>{})).catch(e=>toast_('Share failed: '+e.message,'error'));}}
           ]);
         }}
@@ -1367,7 +1681,7 @@ export function Vault({ onLogout }) {
 
       <GroupPicker visible={showGroupPick} onClose={()=>{setShowGroupPick(false);setPending([]);}} groups={groups} count={pending.length} onPick={onPickGroup} onCreateNew={onCreateNew}/>
 
-      <Sheet visible={showNewLabel} onClose={()=>{setShowNewLabel(false);setPending([]);setSaveViaNew(false);setNewLabelError('');}}>
+      <Sheet visible={showNewLabel} onClose={()=>{setShowNewLabel(false);setPending([]);setSaveViaNew(false);setMoveViaNew(false);setNewLabelError('');}}>
         <View style={{padding:SPACING.lg}}>
           <Text style={{fontFamily:FONTS.heading,color:COLORS.textPrimary,fontSize:17,marginBottom:4}}>Name this group</Text>
           <Text style={{fontFamily:FONTS.body,color:COLORS.textSecondary,fontSize:13,marginBottom:SPACING.md}}>e.g. "Goa Trip", "Personal", "Work"</Text>
@@ -1390,14 +1704,25 @@ export function Vault({ onLogout }) {
         </View>
       </Sheet>
 
-      <PassSheet visible={showNewPass} onClose={()=>{setShowNewPass(false);setPending([]);setSaveViaNew(false);}}
-        onConfirm={confirmNewPass} title={`Passphrase for "${newLabel}"`} subtitle={`Encrypts ${pending.length} item${pending.length!==1?'s':''}`} confirmLabel="Encrypt & Add" withConfirm/>
+      <PassSheet visible={showNewPass} onClose={()=>{setShowNewPass(false);setPending([]);setSaveViaNew(false);setMoveViaNew(false);}}
+        onConfirm={confirmNewPass} title={`Passphrase for "${newLabel}"`}
+        subtitle={moveViaNew ? `Will encrypt ${moveIds?.length||0} moved item${(moveIds?.length||0)!==1?'s':''}` : `Encrypts ${pending.length} item${pending.length!==1?'s':''}`}
+        confirmLabel={moveViaNew ? 'Create & Move' : 'Encrypt & Add'} withConfirm/>
 
       <PassSheet visible={!!showExistingPass} onClose={()=>{setShowExistingPass(null);setPending([]);}}
         onConfirm={confirmExistingPass} title={`Add to "${showExistingPass?.label}"`} subtitle="Confirm group passphrase" confirmLabel="Encrypt & Add"/>
 
       <GroupPicker visible={!!savePending&&!saveGroup} onClose={()=>setSavePending(null)} groups={groups} count={savePending?.items?.length||1}
-        onPick={g=>setSaveGroup(g)} onCreateNew={()=>{setNewLabel('');setShowNewLabel(true);setSaveViaNew(true);}}/>
+        title="Move to group"
+        subtitle={`${savePending?.items?.length||1} shared item${(savePending?.items?.length||1)!==1?'s':''} will be re-encrypted with your group's passphrase`}
+        onPick={g=>setSaveGroup(g)}
+        onCreateNew={()=>{
+          // If the imported files named their group in the filename, start
+          // from that name rather than making the user retype it.
+          const suggested = savePending?.items?.find(i=>i.suggestedGroup)?.suggestedGroup || '';
+          setNewLabel(groups.some(g=>g.label.toLowerCase()===suggested.toLowerCase()) ? '' : suggested);
+          setShowNewLabel(true); setSaveViaNew(true);
+        }}/>
       <PassSheet visible={!!saveGroup} onClose={()=>setSaveGroup(null)}
         onConfirm={async pw=>{
           const g=saveGroup,sp=savePending; setSaveGroup(null); setSavePending(null);
@@ -1406,6 +1731,29 @@ export function Vault({ onLogout }) {
           await saveToVault(sp,pw,g);
         }}
         title={`Save to "${saveGroup?.label}"`} subtitle="Confirm group passphrase" confirmLabel="Save"/>
+
+      <GroupPicker
+        visible={showMovePick}
+        onClose={()=>{setShowMovePick(false);moveCtx.current=null;setMoveIds(null);}}
+        groups={groups.filter(g=>g.id!=='__ungrouped')}
+        count={moveIds?.length||0}
+        title="Move to group"
+        subtitle={`${moveIds?.length||0} item${(moveIds?.length||0)!==1?'s':''} will be re-encrypted with the destination group's passphrase`}
+        newLabel="+ New Group"
+        onPick={onMoveTargetPicked}
+        onCreateNew={()=>{setShowMovePick(false);setNewLabel('');setMoveViaNew(true);setTimeout(()=>setShowNewLabel(true),350);}}
+      />
+      <PassSheet
+        visible={!!movePassPrompt}
+        onClose={()=>{setMovePassPrompt(null);moveCtx.current=null;setMoveIds(null);}}
+        onConfirm={onMovePass}
+        title={movePassPrompt?.kind==='source' ? 'Unlock the originals' : `Passphrase for "${movePassPrompt?.group?.label}"`}
+        subtitle={movePassPrompt?.kind==='source'
+          ? 'Enter the passphrase these items are currently encrypted with'
+          : 'Confirm the destination group\u2019s passphrase'}
+        confirmLabel={movePassPrompt?.kind==='source' ? 'Next' : 'Move'}
+        loading={!!proc}
+      />
 
       <Toast visible={toast.visible} message={toast.msg} type={toast.type} onHide={()=>setToast(t=>({...t,visible:false}))}/>
     </View>

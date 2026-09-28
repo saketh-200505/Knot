@@ -1120,14 +1120,33 @@ function decryptReplyPreview(rp, key) {
 }
 
 // ─── SwipeToReply ────────────────────────────────────────────────────────────
-// WhatsApp-style: drag a bubble right past the threshold to fire reply.
-// PanResponder only claims the touch once the horizontal drag clearly beats
-// vertical movement, so FlatList vertical scrolling still works normally.
-const SWIPE_TRIGGER = 60;      // px drag before we fire reply
-const SWIPE_MAX     = 90;      // clamp so the bubble doesn't fly off-screen
+// WhatsApp-style: drag a bubble toward its own side past the threshold, let
+// go, and the reply fires. Three rules make it feel right:
+//
+//  1. Reply fires on RELEASE, not mid-drag. Firing the moment the finger
+//     crossed 60px meant a swipe you changed your mind about still replied,
+//     and there was no way to back out once started.
+//  2. The gesture is claimed in the bubble phase only, never the capture
+//     phase. Capturing made the whole message list feel sticky, because a
+//     slightly-diagonal flick was stolen from the FlatList before it could
+//     scroll.
+//  3. Once claimed, it is not given back (onPanResponderTerminationRequest),
+//     so the list can't yank a half-finished swipe away.
+const SWIPE_TRIGGER = 48;      // px of travel before a release counts as reply
+const SWIPE_MAX     = 78;      // hard clamp so the bubble can't fly off-screen
+const SWIPE_CLAIM   = 12;      // px before we claim the gesture from the list
+const SWIPE_BIAS    = 1.4;     // horizontal must beat vertical by this much
+
+// Haptics is optional at runtime: the tick on crossing the threshold is a
+// nicety, and a missing/older native module shouldn't break replying.
+let Haptics = null;
+try { Haptics = require('expo-haptics'); } catch { /* no haptics on this build */ }
+
 function SwipeToReply({ item, identity, contact, onReply, onLongPress }) {
   const translateX = useRef(new Animated.Value(0)).current;
-  const firedRef   = useRef(false);
+  const armedRef   = useRef(false);  // has this drag crossed the threshold?
+  const dxRef      = useRef(0);      // latest raw dx — release handlers get a
+                                     // reset gestureState on some Android builds
   // Latest handlers held in refs so the PanResponder — created once and never
   // rebuilt — always calls the current callbacks. Without this, a swipe made
   // after the keyboard opened would fire the *first* onReply closure, which
@@ -1135,43 +1154,93 @@ function SwipeToReply({ item, identity, contact, onReply, onLongPress }) {
   const onReplyRef = useRef(onReply);
   onReplyRef.current = onReply;
 
+  // Your own bubbles sit on the right, so they swipe left toward an icon on
+  // the right; received bubbles do the mirror image. Swiping "outward" like
+  // this reads as pulling the message toward the reply, rather than shoving
+  // it across the screen.
+  const dir = item.fromMe ? -1 : 1;
+  const dirRef = useRef(dir);
+  dirRef.current = dir;
+
+  // useNativeDriver is deliberately OFF. The drag itself drives translateX
+  // with setValue() from JS, and once a native-driven animation has touched a
+  // node, later JS setValue() calls on it are dropped with a warning — which
+  // showed up as the bubble sticking part-way or snapping back at the wrong
+  // moment. One driver for the whole gesture keeps it consistent, and a
+  // single-row translate is cheap enough on the JS driver.
+  const springBack = () => {
+    armedRef.current = false;
+    Animated.spring(translateX, {
+      toValue: 0,
+      useNativeDriver: false,
+      bounciness: 6,
+      speed: 20,
+    }).start();
+  };
+
   const panResponder = useRef(
     PanResponder.create({
-      // Claim capture-phase too so a focused TextInput's touch-target above
-      // this row can't swallow the drag before we see it.
-      onMoveShouldSetPanResponder: (_, g) =>
-        Math.abs(g.dx) > 10 && Math.abs(g.dx) > Math.abs(g.dy) * 1.4 && g.dx > 0,
-      onMoveShouldSetPanResponderCapture: (_, g) =>
-        Math.abs(g.dx) > 10 && Math.abs(g.dx) > Math.abs(g.dy) * 1.4 && g.dx > 0,
-      onPanResponderGrant: () => { firedRef.current = false; },
+      // Never claim on touch-down — a tap or long-press must reach the bubble.
+      onStartShouldSetPanResponder: () => false,
+      // Bubble phase only. Claiming in the capture phase steals vertical
+      // scrolls from the FlatList, which is what made swiping feel broken.
+      onMoveShouldSetPanResponder: (_, g) => {
+        const d = g.dx * dirRef.current;
+        return d > SWIPE_CLAIM && d > Math.abs(g.dy) * SWIPE_BIAS;
+      },
+      // Once we own the gesture, keep it until the finger lifts.
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+
+      onPanResponderGrant: () => { armedRef.current = false; dxRef.current = 0; },
+
       onPanResponderMove: (_, g) => {
-        const dx = Math.max(0, Math.min(g.dx, SWIPE_MAX));
-        translateX.setValue(dx);
-        if (!firedRef.current && dx >= SWIPE_TRIGGER) {
-          firedRef.current = true;
-          onReplyRef.current?.();
+        const raw = Math.max(0, g.dx * dirRef.current);
+        dxRef.current = raw;
+        // Past the trigger the bubble resists: it keeps moving, but at ~35%
+        // of finger speed, so you can feel that you've reached the point
+        // where letting go will reply.
+        const travel = raw <= SWIPE_TRIGGER
+          ? raw
+          : Math.min(SWIPE_MAX, SWIPE_TRIGGER + (raw - SWIPE_TRIGGER) * 0.35);
+        translateX.setValue(travel * dirRef.current);
+
+        const armed = raw >= SWIPE_TRIGGER;
+        if (armed !== armedRef.current) {
+          armedRef.current = armed;
+          // Tick only on the arming edge, not on every crossing back and
+          // forth, so wobbling at the threshold doesn't buzz repeatedly.
+          if (armed && Haptics?.impactAsync) {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+          }
         }
       },
-      onPanResponderRelease: () => {
-        Animated.spring(translateX, {
-          toValue: 0,
-          useNativeDriver: true,
-          bounciness: 8,
-          speed: 18,
-        }).start();
+
+      onPanResponderRelease: (_, g) => {
+        // g.dx is authoritative when present; dxRef covers the Android case
+        // where the release event arrives with a zeroed gestureState.
+        const raw = Math.max(g.dx * dirRef.current, dxRef.current);
+        const shouldReply = raw >= SWIPE_TRIGGER;
+        springBack();
+        if (shouldReply) onReplyRef.current?.();
       },
-      onPanResponderTerminate: () => {
-        Animated.spring(translateX, { toValue: 0, useNativeDriver: true }).start();
-      },
+
+      onPanResponderTerminate: () => springBack(),
     })
   ).current;
 
-  const iconOpacity = translateX.interpolate({
-    inputRange: [0, SWIPE_TRIGGER],
-    outputRange: [0, 1],
+  // The icon tracks absolute travel, so the interpolation is the same for
+  // both directions.
+  const absX = translateX.interpolate({
+    inputRange:  [-SWIPE_MAX, 0, SWIPE_MAX],
+    outputRange: [SWIPE_MAX, 0, SWIPE_MAX],
+  });
+  const iconOpacity = absX.interpolate({
+    inputRange: [0, SWIPE_TRIGGER * 0.5, SWIPE_TRIGGER],
+    outputRange: [0, 0.45, 1],
     extrapolate: 'clamp',
   });
-  const iconScale = translateX.interpolate({
+  const iconScale = absX.interpolate({
     inputRange: [0, SWIPE_TRIGGER],
     outputRange: [0.6, 1],
     extrapolate: 'clamp',
@@ -1182,7 +1251,11 @@ function SwipeToReply({ item, identity, contact, onReply, onLongPress }) {
     <View style={s.swipeRow}>
       <Animated.View
         pointerEvents="none"
-        style={[s.replyHint, { opacity: iconOpacity, transform: [{ scale: iconScale }] }]}
+        style={[
+          s.replyHint,
+          item.fromMe ? s.replyHintMe : s.replyHintThem,
+          { opacity: iconOpacity, transform: [{ scale: iconScale }] },
+        ]}
       >
         <Text style={s.replyHintTxt}>↩</Text>
       </Animated.View>
@@ -1322,7 +1395,9 @@ const s = StyleSheet.create({
 
   // Swipe-to-reply
   swipeRow:   { position: 'relative' },
-  replyHint:  { position: 'absolute', left: 12, top: 0, bottom: 0, width: 44, alignItems: 'center', justifyContent: 'center' },
+  replyHint:  { position: 'absolute', top: 0, bottom: 0, width: 44, alignItems: 'center', justifyContent: 'center' },
+  replyHintThem: { left: 12 },
+  replyHintMe:   { right: 12 },
   replyHintTxt: { fontSize: 20, color: COLORS.indigo },
 
   // Unread badge on room rows

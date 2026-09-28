@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as FileSystem from 'expo-file-system';
 
 const KEYS = {
   ONBOARDED:         'av_onboarded',
@@ -10,10 +11,15 @@ const KEYS = {
   GROUPS:            'av_groups',
   AUDIT_LOG:         'av_audit_log',
   IMPORTED_INDEX:    'av_imported_index',
-  BACKUP_DIR_URI:    'av_backup_dir_uri',
+  SAVED_DIR_URI:     'av_saved_dir_uri',
   SHARED_SUBDIR_URI: 'av_shared_subdir_uri',
-  STORAGE_PROMPT_SHOWN: 'av_storage_prompt_shown',
 };
+
+// Pre-1.1.7 key for the same setting, back when the folder was framed as an
+// optional "backup" rather than the vault's primary storage. Read once by
+// getSavedDirUri() and migrated forward, so upgrading installs don't lose the
+// folder they already granted.
+const LEGACY_BACKUP_DIR_KEY = 'av_backup_dir_uri';
 
 export { KEYS };
 
@@ -34,6 +40,32 @@ export function prettyFilename({ kind = 'vault', groupLabel = '', ext = 'dat' } 
   if (slug) parts.push(slug);
   parts.push(ts, rand);
   return parts.join('_') + '.' + ext;
+}
+
+// Inverse of prettyFilename(): recovers what a Knot file's name says about
+// itself. Used to re-link moved files and to suggest a group name when an
+// encrypted file is imported from somewhere else.
+//
+// Shapes produced by prettyFilename():
+//   Knot_<ts>_<rand>.dat                  — vault, no group label
+//   Knot_<Slug>_<ts>_<rand>.dat           — vault, grouped
+//   Knot_shared_<ts>_<rand>.dat           — shared
+//   Knot_shared_<Slug>_<ts>_<rand>.dat    — shared, grouped
+//
+// Returns null for anything that isn't ours — never guess, since a false
+// positive here would invent a group the user never made.
+export function parseKnotFilename(name = '') {
+  const base = String(name).split('/').pop().replace(/\.[^.]+$/, '');
+  // <date>_<time>_<rand> is a fixed-width tail: 8 digits, 6 digits, 4 hex.
+  const m = base.match(/^Knot_(?:(shared)_)?(?:(.+)_)?(\d{8})_(\d{6})_([0-9a-f]{4})$/);
+  if (!m) return null;
+  return {
+    kind:      m[1] ? 'shared' : 'vault',
+    groupSlug: m[2] || null,
+    date:      m[3],
+    time:      m[4],
+    rand:      m[5],
+  };
 }
 
 export const storage = {
@@ -80,6 +112,32 @@ export async function removePhotoFromIndex(id) {
   const idx = await getPhotoIndex();
   const filtered = idx.filter(p => p.id !== id);
   return savePhotoIndex(filtered);
+}
+
+export async function updatePhotoEntry(id, patch) {
+  const idx = await getPhotoIndex();
+  const i = idx.findIndex(p => p.id === id);
+  if (i === -1) return null;
+  idx[i] = { ...idx[i], ...patch };
+  await savePhotoIndex(idx);
+  return idx[i];
+}
+
+// Entries written before filenames became the stable identity only have an
+// absolute filePath. Derive fileName from it once so resolveFilePath() can
+// re-link them after a folder move like any newer entry. Cheap no-op after
+// the first run; called from the vault's initial load.
+export async function backfillPhotoFileNames() {
+  const idx = await getPhotoIndex();
+  let changed = false;
+  for (const p of idx) {
+    if (!p.fileName && p.filePath) {
+      p.fileName = fileNameFromUri(p.filePath);
+      changed = true;
+    }
+  }
+  if (changed) await savePhotoIndex(idx);
+  return idx;
 }
 
 export async function isOnboarded() {
@@ -175,29 +233,41 @@ export async function updateImportedEntry(id, patch) {
   return idx[i];
 }
 
-// ─── Visible backup folder (Storage Access Framework) ───────────────────────
-// A user-chosen public folder (e.g. Downloads, or a custom "Knot" folder)
-// that encrypted .dat files can be copied into, so they're actually
-// browsable in any file manager — unlike Android/data, which the OS hides
-// from third-party apps on Android 11+. We persist the granted SAF URI so
-// the user only has to pick the folder once.
-export async function getBackupDirUri() {
-  return storage.get(KEYS.BACKUP_DIR_URI);
+// ─── Saved folder (Storage Access Framework) ────────────────────────────────
+// The user-chosen public folder (e.g. Downloads, or a custom "Knot" folder)
+// that encrypted .dat files are written into. This is not a backup — once
+// chosen it holds the only copy, which is why encryption is gated on having
+// one. Android/data, the alternative, is hidden from third-party apps on
+// Android 11+, so files written there are effectively invisible to the user.
+// We persist the granted SAF URI so the folder is picked only once.
+export async function getSavedDirUri() {
+  const uri = await storage.get(KEYS.SAVED_DIR_URI);
+  if (uri) return uri;
+  // One-time migration from the old "backup folder" key.
+  const legacy = await storage.get(LEGACY_BACKUP_DIR_KEY);
+  if (legacy) {
+    await storage.set(KEYS.SAVED_DIR_URI, legacy);
+    await storage.remove(LEGACY_BACKUP_DIR_KEY);
+    return legacy;
+  }
+  return null;
 }
-export async function setBackupDirUri(uri) {
-  // Any cached shared/ subfolder URI belongs to the *previous* backup root,
-  // so invalidate it whenever the root changes.
+export async function setSavedDirUri(uri) {
+  // Any cached shared/ subfolder URI belongs to the *previous* root, so
+  // invalidate it whenever the root changes.
   await storage.remove(KEYS.SHARED_SUBDIR_URI);
-  return storage.set(KEYS.BACKUP_DIR_URI, uri);
+  if (uri == null) return storage.remove(KEYS.SAVED_DIR_URI);
+  return storage.set(KEYS.SAVED_DIR_URI, uri);
 }
-export async function clearBackupDirUri() {
+export async function clearSavedDirUri() {
   await storage.remove(KEYS.SHARED_SUBDIR_URI);
-  return storage.remove(KEYS.BACKUP_DIR_URI);
+  await storage.remove(LEGACY_BACKUP_DIR_KEY);
+  return storage.remove(KEYS.SAVED_DIR_URI);
 }
 
-// URI of the "shared/" subfolder created inside the user's backup dir the
-// first time a shared/imported file is written there. Cached so we don't
-// re-create (or duplicate) the folder on every import.
+// URI of the "shared/" subfolder created inside the saved folder the first
+// time a shared/imported file is written there. Cached so we don't re-create
+// (or duplicate) the folder on every import.
 export async function getSharedSubdirUri() {
   return storage.get(KEYS.SHARED_SUBDIR_URI);
 }
@@ -208,12 +278,93 @@ export async function clearSharedSubdirUri() {
   return storage.remove(KEYS.SHARED_SUBDIR_URI);
 }
 
-// Whether we've already asked the user once about choosing a visible backup
-// folder (on first encrypt, or after a previously-chosen folder went stale).
-// Prevents re-nagging every single encryption once they've made a choice.
-export async function isStoragePromptShown() {
-  return (await storage.get(KEYS.STORAGE_PROMPT_SHOWN)) === 'true';
+// ─── Locating a file that may have moved ────────────────────────────────────
+// A photo's filePath is an absolute SAF content:// URI captured at encryption
+// time. It dies the moment the user re-picks the folder, moves the files in a
+// file manager, or reinstalls — even though the .dat itself is perfectly
+// intact. The *filename* is the stable identity (prettyFilename() makes it
+// unique), so when a path stops resolving we look the file up by name in the
+// current saved folder and repair the index.
+
+// Directory listings are the expensive part (one IPC round-trip each), and a
+// bulk unlock resolves dozens of files back to back. Cache the listing per
+// directory and invalidate it whenever we write to that directory.
+const dirListingCache = new Map(); // dirUri -> Promise<string[]>
+
+export function invalidateDirListingCache(dirUri) {
+  if (dirUri) dirListingCache.delete(dirUri);
+  else dirListingCache.clear();
 }
-export async function setStoragePromptShown() {
-  return storage.set(KEYS.STORAGE_PROMPT_SHOWN, 'true');
+
+async function listDir(dirUri) {
+  if (!dirListingCache.has(dirUri)) {
+    dirListingCache.set(
+      dirUri,
+      FileSystem.StorageAccessFramework.readDirectoryAsync(dirUri).catch(() => [])
+    );
+  }
+  return dirListingCache.get(dirUri);
+}
+
+// The tail of a SAF document URI is the percent-encoded full document id,
+// e.g. ".../document/primary%3ADownload%2FKnot_Trip_20260928_211600_a1b2.dat".
+// We only care about the final path segment of that id.
+function fileNameFromUri(uri = '') {
+  try {
+    const decoded = decodeURIComponent(String(uri));
+    return decoded.split(/[\/:]/).pop() || null;
+  } catch {
+    return String(uri).split('/').pop() || null;
+  }
+}
+
+export { fileNameFromUri };
+
+// Returns a readable URI for `entry`, repairing entry.filePath in the given
+// index as a side effect when the file turns out to have moved. `indexKind`
+// picks which index to write the repair back to.
+// Returns null when the file genuinely can't be found.
+export async function resolveFilePath(entry, savedDirUri, indexKind = 'photo') {
+  if (!entry) return null;
+  const stored = entry.filePath;
+  const wanted = entry.fileName || fileNameFromUri(stored);
+
+  // file:// paths (iOS, and the Android internal fallback) stat reliably, so
+  // a cheap existence check settles it.
+  if (stored && !stored.startsWith('content://')) {
+    try {
+      const info = await FileSystem.getInfoAsync(stored);
+      if (info?.exists) return stored;
+    } catch { /* fall through to the lookup below */ }
+  }
+
+  // SAF content:// URIs don't stat reliably — getInfoAsync's behaviour on
+  // them varies by OEM and by whether the grant is still alive — so we settle
+  // it against the directory listing instead. The listing is cached, so a
+  // bulk unlock costs one round-trip, not one per photo.
+  if (wanted && savedDirUri) {
+    const candidates = [savedDirUri];
+    const sharedSub = await getSharedSubdirUri();
+    if (sharedSub) candidates.push(sharedSub);
+
+    for (const dir of candidates) {
+      const uris = await listDir(dir);
+      const hit = uris.find(u => fileNameFromUri(u) === wanted);
+      if (!hit) continue;
+      // Repair the index only when the path actually changed, so a normal
+      // read doesn't rewrite AsyncStorage on every photo.
+      if (hit !== stored || entry.fileName !== wanted) {
+        const patch = { filePath: hit, fileName: wanted };
+        if (indexKind === 'imported') await updateImportedEntry(entry.id, patch);
+        else                          await updatePhotoEntry(entry.id, patch);
+      }
+      return hit;
+    }
+  }
+
+  // Nothing matched by name. If we still have a stored content:// URI its
+  // grant may yet be alive (e.g. the folder setting was cleared but the
+  // permission wasn't), so hand it back and let the caller's own read decide
+  // — a real attempt beats guessing.
+  return stored && stored.startsWith('content://') ? stored : null;
 }

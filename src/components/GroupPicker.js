@@ -3,13 +3,20 @@ import { View, Text, TouchableOpacity, StyleSheet, FlatList } from 'react-native
 import { Sheet } from './Sheet';
 import { COLORS, FONTS, RADIUS, SPACING } from '../utils/theme';
 
-export function GroupPicker({ visible, onClose, groups, count, onPick, onCreateNew }) {
+export function GroupPicker({
+  visible, onClose, groups, count, onPick, onCreateNew,
+  // Overridable so the same picker can front an import ("Add to group") or a
+  // move ("Move to group") without cloning the component.
+  title = 'Add to group',
+  subtitle,
+  newLabel = '+ New Group',
+}) {
   return (
     <Sheet visible={visible} onClose={onClose}>
       <View style={{ paddingHorizontal: SPACING.lg, paddingTop: SPACING.sm }}>
-        <Text style={s.title}>Add to group</Text>
+        <Text style={s.title}>{title}</Text>
         <Text style={s.subtitle}>
-          {count} photo{count !== 1 ? 's' : ''} will be encrypted with that group's passphrase
+          {subtitle ?? `${count} photo${count !== 1 ? 's' : ''} will be encrypted with that group's passphrase`}
         </Text>
 
         {groups.length > 0 && (
@@ -28,7 +35,7 @@ export function GroupPicker({ visible, onClose, groups, count, onPick, onCreateN
         )}
 
         <TouchableOpacity style={s.btn} onPress={onCreateNew}>
-          <Text style={s.btnTxt}>+ New Group</Text>
+          <Text style={s.btnTxt}>{newLabel}</Text>
         </TouchableOpacity>
       </View>
     </Sheet>

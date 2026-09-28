@@ -13,8 +13,9 @@ import {
 } from '../utils/crypto';
 import {
   getImportedIndex, addImportedToIndex, removeImportedFromIndex, logEvent,
-  getBackupDirUri, getSharedSubdirUri, setSharedSubdirUri, clearSharedSubdirUri,
-  prettyFilename,
+  getSavedDirUri, getSharedSubdirUri, setSharedSubdirUri, clearSharedSubdirUri,
+  resolveFilePath, invalidateDirListingCache,
+  prettyFilename, parseKnotFilename,
 } from '../utils/storage';
 import { PassSheet } from './PassSheet';
 import { showAlert } from './ThemedAlert';
@@ -29,6 +30,17 @@ async function ensureSharedDir() {
   if (!info.exists) await FileSystem.makeDirectoryAsync(SHARED_DIR, { intermediates: true });
 }
 function genId() { return 'shared_' + Date.now().toString(36) + Math.random().toString(36).slice(2); }
+
+// SAF documents and plain file:// paths need different delete calls, and the
+// wrong one fails silently — leaving the file behind after the user removed
+// it from the tab.
+async function deleteAnyPath(path) {
+  if (!path) return;
+  try {
+    if (path.startsWith('content://')) await FileSystem.StorageAccessFramework.deleteAsync(path);
+    else                               await FileSystem.deleteAsync(path, { idempotent: true });
+  } catch { /* already gone, or grant lost */ }
+}
 
 function guessMime(name = '') {
   const ext = name.split('.').pop().toLowerCase();
@@ -111,7 +123,7 @@ function Viewer({ item, dec, onClose, onSave, onShare }) {
 
       <View style={v.bar}>
         <TouchableOpacity style={v.btn} onPress={onSave} activeOpacity={0.8}>
-          <Text style={v.btnTxt}>⬇  Save to Vault</Text>
+          <Text style={v.btnTxt}>⬇  Move to Group</Text>
         </TouchableOpacity>
         <TouchableOpacity style={[v.btn,v.btnBlue]} onPress={onShare} activeOpacity={0.8}>
           <Text style={v.btnTxt}>↗  Share</Text>
@@ -139,26 +151,31 @@ export function SharedTab({ onSaveToVault, showToast }) {
   // "shared (1)", "shared (2)" duplicates. A stale cache (folder deleted
   // by the user, permission revoked) is caught by the write path below and
   // cleared, so the next import re-creates it.
-  const ensureSharedSubdir = async (backupDirUri) => {
+  const ensureSharedSubdir = async (savedDirUri) => {
     const cached = await getSharedSubdirUri();
     if (cached) return cached;
-    const created = await FileSystem.StorageAccessFramework.makeDirectoryAsync(backupDirUri, 'shared');
+    const created = await FileSystem.StorageAccessFramework.makeDirectoryAsync(savedDirUri, 'shared');
     await setSharedSubdirUri(created);
     return created;
   };
 
-  // Puts the imported file wherever the user's storage settings say it
-  // should go: <backupRoot>/shared/ if a base folder was picked, else the
-  // internal app sandbox. Falls back to the sandbox on any SAF failure so
-  // an import never gets lost.
+  // Puts the imported file in <savedRoot>/shared/ if a folder was picked,
+  // else the internal app sandbox. Falls back to the sandbox on any SAF
+  // failure so an import never gets lost.
+  //
+  // shared/ stays a separate staging area on purpose: these files are sealed
+  // with somebody else's passphrase, and mixing them into the main folder
+  // would make it impossible to tell, from the folder alone, which of your
+  // own passphrases should open what.
   const writeSharedFile = async (sourceUri, filename) => {
-    const backupDirUri = await getBackupDirUri();
-    if (backupDirUri) {
+    const savedDirUri = await getSavedDirUri();
+    if (savedDirUri) {
       try {
-        const sharedDirUri = await ensureSharedSubdir(backupDirUri);
+        const sharedDirUri = await ensureSharedSubdir(savedDirUri);
         const b64 = await FileSystem.readAsStringAsync(sourceUri, { encoding: FileSystem.EncodingType.Base64 });
         const fileUri = await FileSystem.StorageAccessFramework.createFileAsync(sharedDirUri, filename, 'application/octet-stream');
         await FileSystem.writeAsStringAsync(fileUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+        invalidateDirListingCache(sharedDirUri);
         return fileUri;
       } catch (e) {
         // Grant dead or subfolder missing — drop the cache so the next
@@ -179,13 +196,30 @@ export function SharedTab({ onSaveToVault, showToast }) {
       if (res.canceled || !res.assets?.length) return;
       const asset = res.assets[0];
       const id = genId();
-      const filename = prettyFilename({ kind: 'shared' });
+      // A Knot file names the group it came from (Knot_<Group>_<date>_…).
+      // Keep the ORIGINAL filename rather than minting a fresh one, so that
+      // evidence survives the import and can pre-fill a group later — the
+      // old code overwrote it and threw the group name away.
+      const parsed   = parseKnotFilename(asset.name || '');
+      const filename = asset.name || prettyFilename({ kind: 'shared' });
       const destPath = await writeSharedFile(asset.uri, filename);
-      const entry = { id, filePath: destPath, name: asset.name || filename, addedAt: Date.now() };
+      const entry = {
+        id,
+        filePath: destPath,
+        fileName: filename,
+        name: asset.name || filename,
+        suggestedGroup: parsed?.groupSlug || null,
+        addedAt: Date.now(),
+      };
       await addImportedToIndex(entry);
       await logEvent('shared_import', entry.name);
       await load();
-      showToast?.('Imported — tap the tile to unlock', 'success');
+      showToast?.(
+        parsed?.groupSlug
+          ? `Imported — looks like "${parsed.groupSlug}". Tap to unlock.`
+          : 'Imported — tap the tile to unlock',
+        'success'
+      );
     } catch (e) {
       showToast?.('Import failed: ' + e.message, 'error');
     }
@@ -196,7 +230,11 @@ export function SharedTab({ onSaveToVault, showToast }) {
     setUnlock(null);
     setLoadingId(item.id);
     try {
-      const b64   = await FileSystem.readAsStringAsync(item.filePath, { encoding: FileSystem.EncodingType.Base64 });
+      // The stored path dies whenever the saved folder is re-picked or the
+      // files are moved; resolveFilePath finds the file by name again.
+      const path  = await resolveFilePath(item, await getSavedDirUri(), 'imported');
+      if (!path) throw new Error('missing');
+      const b64   = await FileSystem.readAsStringAsync(path, { encoding: FileSystem.EncodingType.Base64 });
       const plain = await unseal(base64ToUint8(b64), passphrase);
       const mime  = sniffMime(plain, item.name);
       let uri;
@@ -220,30 +258,44 @@ export function SharedTab({ onSaveToVault, showToast }) {
 
   const shareEncrypted = async (item) => {
     if (!(await Sharing.isAvailableAsync())) { showToast?.('Sharing not available', 'error'); return; }
-    await Sharing.shareAsync(item.filePath, { mimeType: 'application/octet-stream', dialogTitle: 'Share encrypted file' });
+    const path = await resolveFilePath(item, await getSavedDirUri(), 'imported');
+    if (!path) { showToast?.('File not found on disk', 'error'); return; }
+    await Sharing.shareAsync(path, { mimeType: 'application/octet-stream', dialogTitle: 'Share encrypted file' });
     await logEvent('share_encrypted', item.name);
   };
 
-  const doSaveToVault = (item) => {
+  const doMoveToGroup = (item) => {
     const dec = decrypted[item.id];
     if (!dec) return;
     setViewItem(null);
-    saveItemsToVault([item]);
+    moveItemsToGroup([item]);
   };
 
-  // Shared cleanup + save path for both the single-item viewer save and the
-  // multi-select batch save below — same logic, just looped over N items.
-  const saveItemsToVault = (targetItems) => {
+  // Moves unlocked shared files into one of your own groups: the plaintext
+  // goes up to the vault, which re-encrypts it under that group's passphrase,
+  // and only once that succeeds is the shared copy removed. Same path for the
+  // single-item viewer action and the multi-select batch.
+  const moveItemsToGroup = (targetItems) => {
     const forSave = targetItems.map(item => {
       const dec = decrypted[item.id];
-      return { id: item.id, plainB64: dec.plainB64, mime: dec.mime, name: item.name };
+      return {
+        id: item.id,
+        plainB64: dec.plainB64,
+        mime: dec.mime,
+        name: item.name,
+        // Lets the vault pre-fill a new group's name when the file told us
+        // which group it came from.
+        suggestedGroup: item.suggestedGroup || null,
+      };
     }).filter(x => x.plainB64);
     if (!forSave.length) return;
 
     onSaveToVault?.(forSave, async () => {
+      const savedDirUri = await getSavedDirUri();
       for (const item of targetItems) {
-        const dec = decrypted[item.id];
-        await FileSystem.deleteAsync(item.filePath, { idempotent: true });
+        const dec  = decrypted[item.id];
+        const path = await resolveFilePath(item, savedDirUri, 'imported');
+        await deleteAnyPath(path);
         if (dec?.mime?.startsWith('video/')) await FileSystem.deleteAsync(dec.uri, { idempotent: true }).catch(() => {});
         await removeImportedFromIndex(item.id);
       }
@@ -279,18 +331,19 @@ export function SharedTab({ onSaveToVault, showToast }) {
     setSelectedIds(new Set());
   };
 
-  const saveSelectedToVault = () => {
+  const moveSelectedToGroup = () => {
     const targetItems = items.filter(i => selectedIds.has(i.id) && decrypted[i.id]);
     cancelSelect();
-    saveItemsToVault(targetItems);
+    moveItemsToGroup(targetItems);
   };
 
   const removeItem = (item) => {
     showAlert('Remove', `Remove "${item.name}" from Shared?`, [
       { text: 'Cancel', style: 'cancel' },
       { text: 'Remove', style: 'destructive', onPress: async () => {
-        const dec = decrypted[item.id];
-        await FileSystem.deleteAsync(item.filePath, { idempotent: true });
+        const dec  = decrypted[item.id];
+        const path = await resolveFilePath(item, await getSavedDirUri(), 'imported');
+        await deleteAnyPath(path);
         if (dec?.mime?.startsWith('video/')) await FileSystem.deleteAsync(dec.uri, { idempotent: true }).catch(() => {});
         await removeImportedFromIndex(item.id);
         setDecrypted(prev => { const n = { ...prev }; delete n[item.id]; return n; });
@@ -316,11 +369,11 @@ export function SharedTab({ onSaveToVault, showToast }) {
     const onLongPress = () => {
       if (selectMode) return; // already selecting — plain tap extends the selection
       if (dec) {
-        // Unlocked already — offer Save to Vault right here, or start a
+        // Unlocked already — offer the move right here, or start a
         // multi-select so several pics can be moved into a group at once.
         showAlert(item.name, 'What would you like to do?', [
           { text: 'Cancel', style: 'cancel' },
-          { text: 'Save to Vault', onPress: () => doSaveToVault(item) },
+          { text: 'Move to Group…', onPress: () => doMoveToGroup(item) },
           { text: 'Select Multiple…', onPress: () => startSelect(item) },
           { text: 'Share Encrypted', onPress: () => shareEncrypted(item) },
           { text: 'Remove', style: 'destructive', onPress: () => removeItem(item) },
@@ -359,6 +412,11 @@ export function SharedTab({ onSaveToVault, showToast }) {
         ) : (
           <View style={s.tileLock}>
             <Text style={{fontSize:26}}>🔒</Text>
+            {/* The filename says which group it came from — showing it tells
+                the user which passphrase to reach for. */}
+            {item.suggestedGroup
+              ? <Text style={s.tileGroupTxt} numberOfLines={1}>{item.suggestedGroup}</Text>
+              : null}
             <Text style={s.tileLockTxt} numberOfLines={2}>{item.name}</Text>
           </View>
         )}
@@ -381,11 +439,11 @@ export function SharedTab({ onSaveToVault, showToast }) {
               </TouchableOpacity>
               <TouchableOpacity
                 style={[s.toolBtn, !selectedIds.size && { opacity: 0.5 }]}
-                onPress={saveSelectedToVault}
+                onPress={moveSelectedToGroup}
                 disabled={!selectedIds.size}
                 activeOpacity={0.8}
               >
-                <Text style={s.toolBtnTxt}>Save to Vault</Text>
+                <Text style={s.toolBtnTxt}>Move to Group</Text>
               </TouchableOpacity>
             </View>
           </>
@@ -403,7 +461,7 @@ export function SharedTab({ onSaveToVault, showToast }) {
         <View style={s.empty}>
           <Text style={{fontSize:52,marginBottom:16}}>📥</Text>
           <Text style={s.emptyTitle}>No imported files</Text>
-          <Text style={s.emptyDesc}>Import an encrypted .dat file — from your backup folder or shared by a friend — then unlock it with the passphrase.</Text>
+          <Text style={s.emptyDesc}>Import an encrypted .dat file — from your Saved Folder or shared by a friend — then unlock it with the passphrase.</Text>
           <TouchableOpacity style={s.emptyBtn} onPress={importFile} activeOpacity={0.8}>
             <Text style={s.emptyBtnTxt}>Import File</Text>
           </TouchableOpacity>
@@ -424,7 +482,7 @@ export function SharedTab({ onSaveToVault, showToast }) {
         onClose={() => setUnlock(null)}
         onConfirm={handleUnlock}
         title="Unlock File"
-        subtitle="Enter the passphrase from the sender (or your own group passphrase for your backups)"
+        subtitle="Enter the passphrase from the sender (or your own group passphrase)"
         confirmLabel="Unlock"
       />
 
@@ -433,7 +491,7 @@ export function SharedTab({ onSaveToVault, showToast }) {
           item={viewItem}
           dec={decrypted[viewItem.id]}
           onClose={() => setViewItem(null)}
-          onSave={() => doSaveToVault(viewItem)}
+          onSave={() => doMoveToGroup(viewItem)}
           onShare={() => shareEncrypted(viewItem)}
         />
       )}
@@ -466,6 +524,7 @@ const s = StyleSheet.create({
   tileImg:    { width:THUMB, height:THUMB, alignItems:'center', justifyContent:'center', backgroundColor:COLORS.surface2 },
   tileLock:   { flex:1, alignItems:'center', justifyContent:'center', gap:6, padding:6 },
   tileLockTxt:{ fontFamily:FONTS.body, color:COLORS.textMuted, fontSize:10, textAlign:'center' },
+  tileGroupTxt:{ fontFamily:FONTS.bodyMed, color:COLORS.indigo, fontSize:11, textAlign:'center' },
   tileOpen:   { position:'absolute', top:6, right:6, width:20, height:20, borderRadius:10, backgroundColor:COLORS.indigo, alignItems:'center', justifyContent:'center' },
   tileOpenSelected: { backgroundColor:COLORS.indigo, borderWidth:2, borderColor:'#fff' },
   tileOpenTxt:{ color:'#fff', fontSize:11, fontFamily:FONTS.bodyMed },

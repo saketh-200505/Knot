@@ -28,10 +28,19 @@ export function useSession() {
   const [showExtend,   setShowExtend]   = useState(false);
   const timerRef = useRef(null);
 
+  // Group keys derived during the current unlock, kept so a later action in
+  // the same session (moving a photo into an already-open group) doesn't have
+  // to re-ask for a passphrase it just accepted. Held in a ref rather than
+  // state because nothing renders from it, and cleared alongside decryptedMap
+  // everywhere — these keys are strictly less sensitive than the plaintext
+  // already sitting in decryptedMap, and must not outlive it.
+  const groupKeysRef = useRef({}); // groupId -> Uint8Array
+
   // ── Wipe ──────────────────────────────────────────────────────────────────
   const wipe = useCallback((reason) => {
     clearInterval(timerRef.current);
     timerRef.current = null;
+    groupKeysRef.current = {};
     setDecryptedMap(prev => {
       // Clean up temp video cache files
       Object.values(prev).forEach(v => {
@@ -63,6 +72,7 @@ export function useSession() {
           clearInterval(timerRef.current);
           timerRef.current = null;
           // Can't call wipe() here (stale closure) — clear map directly
+          groupKeysRef.current = {};
           setDecryptedMap({});
           setActive(false);
           setBlurring(false);
@@ -78,7 +88,7 @@ export function useSession() {
   // ── Unlock ─────────────────────────────────────────────────────────────────
   // `photos` each have: { id, sealedB64, key?, mimeType, mediaType, kdfIterations }
   // key is pre-derived (batch) — if null, falls back to per-photo PBKDF2 (legacy).
-  const unlock = useCallback(async (photos, passphrase, onProgress) => {
+  const unlock = useCallback(async (photos, passphrase, onProgress, groupKeys) => {
     const newMap = {};
     let count = 0;
 
@@ -118,6 +128,12 @@ export function useSession() {
       }
     }
 
+    // Only remember keys if something actually decrypted — a wrong passphrase
+    // still "derives" a key, and caching it would let a later move silently
+    // re-encrypt under garbage.
+    if (count > 0 && groupKeys) {
+      groupKeysRef.current = { ...groupKeysRef.current, ...groupKeys };
+    }
     setDecryptedMap(prev => ({ ...prev, ...newMap }));
     setActive(true);
     const durMin = await getSessionDuration();
@@ -126,10 +142,17 @@ export function useSession() {
     return count;
   }, [startTimer]);
 
-  const extend = useCallback(async (photos, passphrase, onProgress) => {
+  const extend = useCallback(async (photos, passphrase, onProgress, groupKeys) => {
     setShowExtend(false);
-    return unlock(photos, passphrase, onProgress);
+    return unlock(photos, passphrase, onProgress, groupKeys);
   }, [unlock]);
+
+  // Read-only accessor — callers must not hold on to the returned key beyond
+  // the action they need it for.
+  const getGroupKey = useCallback((groupId) => groupKeysRef.current[groupId] || null, []);
+  const rememberGroupKey = useCallback((groupId, key) => {
+    if (groupId && key) groupKeysRef.current[groupId] = key;
+  }, []);
 
   // ── Cleanup on unmount ─────────────────────────────────────────────────────
   useEffect(() => () => {
@@ -150,5 +173,6 @@ export function useSession() {
   return {
     active, decryptedMap, remaining, totalSecs,
     blurring, showExtend, unlock, extend, wipe,
+    getGroupKey, rememberGroupKey,
   };
 }
